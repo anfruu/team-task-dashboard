@@ -70,3 +70,4 @@ if uploaded_file:
 
         st.dataframe(summary, use_container_width=True)
     else:
+        st.info("Please upload a file to see the dashboard.")
