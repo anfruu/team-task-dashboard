@@ -1,0 +1,18 @@
+
+[server]
+enableStaticServing = true
+
+[theme]
+# LPL deep blue (Brandfetch lists  #081D4D). Use as primary for buttons/links.
+primaryColor = "#081D4D"
+
+# Make the overall canvas brighter and cleaner
+backgroundColor = "#FFFFFF"
+
+# Softer card/background for components (uploader, tables)
+secondaryBackgroundColor = "#F7FAFF"
+
+# Text in a deep neutral for readability on white
+textColor = "#1F2937"
+
+font = "sans serif"
