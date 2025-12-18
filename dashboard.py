@@ -787,4 +787,3 @@ with tab_dash:
             st.dataframe(summary, use_container_width=True)
         else:
             st.info("No production summary available for this member.")
-``
