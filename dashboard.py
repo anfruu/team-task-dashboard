@@ -81,7 +81,7 @@ REQUIRED_COLS = [
     "Team Member", "Day", "Duration", "Volume",
 ]
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-DAY_TO_OFFSET = {"Monday":0, "Tuesday":1, "Wednesday":2, "Thursday":3, "Friday":4}
+DAY_TO_OFFSET = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4}
 
 def escape_md(text: object) -> str:
     """Escape Markdown special characters for safe rendering in task list."""
@@ -111,27 +111,32 @@ def parse_hh_dot_mm(s: str) -> int | None:
             h = int(hh)
             m = int(mm)
             if m <= 59:
-                return h*60 + m
-            return int(round(float(s)*60))  # decimal hours
+                return h * 60 + m
+            return int(round(float(s) * 60))  # decimal hours
         else:
             return int(s)  # pure integer -> minutes
     return None
 
 def parse_duration_any(text) -> int:
     """Accept HH.MM, HH:MM, '2h', '90m', plain numbers."""
-    if text is None or (isinstance(text, float) and math.isnan(text)): return 0
+    if text is None or (isinstance(text, float) and math.isnan(text)):
+        return 0
     s = str(text).strip().lower()
     # HH.MM first
     hhmm_dot = parse_hh_dot_mm(s)
-    if hhmm_dot is not None: return hhmm_dot
+    if hhmm_dot is not None:
+        return hhmm_dot
     # HH:MM
     m_colon = re.match(r"^(\d+):(\d{1,2})$", s)
     if m_colon:
-        h = int(m_colon.group(1)); m = int(m_colon.group(2)); return h*60 + m
+        h = int(m_colon.group(1))
+        m = int(m_colon.group(2))
+        return h * 60 + m
     # xh ym
     h = sum(int(x) for x in re.findall(r"(\d+)\s*h", s)) if "h" in s else 0
     m = sum(int(x) for x in re.findall(r"(\d+)\s*m", s)) if "m" in s else 0
-    if h or m: return h*60 + m
+    if h or m:
+        return h * 60 + m
     # plain number -> minutes
     try:
         return int(round(float(s)))
@@ -140,7 +145,8 @@ def parse_duration_any(text) -> int:
 
 def parse_volume(text) -> tuple[int, str | None]:
     """Parse '7 accounts', '50 emails' -> (7, 'accounts'/'emails'); blank -> (0, None)."""
-    if pd.isna(text): return 0, None
+    if pd.isna(text):
+        return 0, None
     s = str(text).strip().lower()
     m = re.search(r"(-?\d+(?:\.\d+)?)", s)
     val = float(m.group(1)) if m else 0
@@ -154,7 +160,7 @@ def compute_dates_from_week_end(df: pd.DataFrame, week_end: pd.Timestamp) -> pd.
     df["date"] = df["Day"].map(lambda d: (week_start + pd.Timedelta(days=DAY_TO_OFFSET.get(str(d), 0))).date())
     df["week_start"] = week_start.date()
     s = pd.to_datetime(df["date"])
-    df["month_start"]   = s.dt.to_period("M").dt.to_timestamp().dt.date
+    df["month_start"] = s.dt.to_period("M").dt.to_timestamp().dt.date
     df["quarter_start"] = s.dt.to_period("Q").dt.start_time.dt.date
     return df
 
@@ -167,19 +173,19 @@ def ensure_period_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
     # Derive anchors if missing
     if "month_start" not in out.columns and "date" in out.columns:
-        out["month_start"]   = out["date"].dt.to_period("M").dt.to_timestamp().dt.date
+        out["month_start"] = out["date"].dt.to_period("M").dt.to_timestamp().dt.date
     if "quarter_start" not in out.columns and "date" in out.columns:
         out["quarter_start"] = out["date"].dt.to_period("Q").dt.start_time.dt.date
     # Numeric safety
     out["duration_minutes"] = pd.to_numeric(out.get("duration_minutes", 0), errors="coerce").fillna(0)
-    out["volume_value"]     = pd.to_numeric(out.get("volume_value", 0), errors="coerce").fillna(0)
+    out["volume_value"] = pd.to_numeric(out.get("volume_value", 0), errors="coerce").fillna(0)
     return out
 
 def _latest_and_prev_month(df: pd.DataFrame, member: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     base = df[df["member"] == member]
     months = sorted(pd.to_datetime(base["month_start"], errors="coerce").dropna().unique())
     if len(months) < 2:
-        return (months[-1] if months else None, None)
+        return (months[-1] if months else None), None
     return months[-1], months[-2]
 
 def build_individual_monthly_comparison(df_all: pd.DataFrame, member: str,
@@ -190,7 +196,7 @@ def build_individual_monthly_comparison(df_all: pd.DataFrame, member: str,
         curr_m, prev_m = _latest_and_prev_month(df, member)
     else:
         curr_m = pd.to_datetime(selected_month)
-        prev_m = (curr_m - pd.offsets.MonthBegin(1))
+        prev_m = curr_m - pd.offsets.MonthBegin(1)
     if curr_m is None or prev_m is None:
         return pd.DataFrame(columns=[
             "Task ID", "Month", "Duration (min)", "Volume",
@@ -202,29 +208,29 @@ def build_individual_monthly_comparison(df_all: pd.DataFrame, member: str,
 
     cur = (base[pd.to_datetime(base["month_start"]) == curr_m]
            .groupby(agg_cols)
-           .agg(cur_duration=("duration_minutes","sum"),
-                cur_volume=("volume_value","sum"))
+           .agg(cur_duration=("duration_minutes", "sum"),
+                cur_volume=("volume_value", "sum"))
            .reset_index())
 
     prev = (base[pd.to_datetime(base["month_start"]) == prev_m]
             .groupby(agg_cols)
-            .agg(prev_duration=("duration_minutes","sum"),
-                 prev_volume=("volume_value","sum"))
+            .agg(prev_duration=("duration_minutes", "sum"),
+                 prev_volume=("volume_value", "sum"))
             .reset_index())
 
     merged = cur.merge(prev, on=agg_cols, how="outer").fillna(0)
     merged["Δ Duration"] = merged["cur_duration"] - merged["prev_duration"]
-    merged["Δ Volume"]   = merged["cur_volume"]   - merged["prev_volume"]
+    merged["Δ Volume"] = merged["cur_volume"] - merged["prev_volume"]
 
-    merged["Task ID"]    = merged["task_id"]
-    merged["Month"]      = pd.to_datetime(curr_m).strftime("%B %Y")
+    merged["Task ID"] = merged["task_id"]
+    merged["Month"] = pd.to_datetime(curr_m).strftime("%B %Y")
     merged["Prev Month"] = pd.to_datetime(prev_m).strftime("%B %Y")
 
-    final = merged[["Task ID","Month","cur_duration","cur_volume",
-                    "Prev Month","prev_duration","prev_volume",
-                    "Δ Duration","Δ Volume"]].rename(columns={
-        "cur_duration":"Duration (min)", "cur_volume":"Volume",
-        "prev_duration":"Prev Duration (min)", "prev_volume":"Prev Volume",
+    final = merged[["Task ID", "Month", "cur_duration", "cur_volume",
+                    "Prev Month", "prev_duration", "prev_volume",
+                    "Δ Duration", "Δ Volume"]].rename(columns={
+        "cur_duration": "Duration (min)", "cur_volume": "Volume",
+        "prev_duration": "Prev Duration (min)", "prev_volume": "Prev Volume",
     }).sort_values(by="Duration (min)", ascending=False)
     return final
 
@@ -237,32 +243,32 @@ def build_individual_quarterly_breakdown(df_all: pd.DataFrame, member: str,
     q = pd.to_datetime(quarter_start) if quarter_start is not None else (quarters[-1] if quarters else None)
     if q is None:
         return pd.DataFrame(columns=[
-            "Task ID","M1 Duration","M1 Volume","M2 Duration","M2 Volume","M3 Duration","M3 Volume",
-            "Quarter Duration","Quarter Volume"
+            "Task ID", "M1 Duration", "M1 Volume", "M2 Duration", "M2 Volume", "M3 Duration", "M3 Volume",
+            "Quarter Duration", "Quarter Volume"
         ])
 
     m1 = q
-    m2 = (q + pd.offsets.MonthBegin(1))
-    m3 = (q + pd.offsets.MonthBegin(2))
+    m2 = q + pd.offsets.MonthBegin(1)
+    m3 = q + pd.offsets.MonthBegin(2)
 
     def agg_month(m):
         return (base[pd.to_datetime(base["month_start"]) == m]
                 .groupby(["task_id"])
-                .agg(duration=("duration_minutes","sum"),
-                     volume=("volume_value","sum"))
+                .agg(duration=("duration_minutes", "sum"),
+                     volume=("volume_value", "sum"))
                 .reset_index())
 
-    df_m1 = agg_month(m1).rename(columns={"duration":"M1 Duration","volume":"M1 Volume"})
-    df_m2 = agg_month(m2).rename(columns={"duration":"M2 Duration","volume":"M2 Volume"})
-    df_m3 = agg_month(m3).rename(columns={"duration":"M3 Duration","volume":"M3 Volume"})
+    df_m1 = agg_month(m1).rename(columns={"duration": "M1 Duration", "volume": "M1 Volume"})
+    df_m2 = agg_month(m2).rename(columns={"duration": "M2 Duration", "volume": "M2 Volume"})
+    df_m3 = agg_month(m3).rename(columns={"duration": "M3 Duration", "volume": "M3 Volume"})
 
     merged = df_m1.merge(df_m2, on="task_id", how="outer").merge(df_m3, on="task_id", how="outer").fillna(0)
-    merged["Quarter Duration"] = merged[["M1 Duration","M2 Duration","M3 Duration"]].sum(axis=1)
-    merged["Quarter Volume"]   = merged[["M1 Volume","M2 Volume","M3 Volume"]].sum(axis=1)
+    merged["Quarter Duration"] = merged[["M1 Duration", "M2 Duration", "M3 Duration"]].sum(axis=1)
+    merged["Quarter Volume"] = merged[["M1 Volume", "M2 Volume", "M3 Volume"]].sum(axis=1)
 
     merged["Task ID"] = merged["task_id"]
-    final = merged[["Task ID","M1 Duration","M1 Volume","M2 Duration","M2 Volume","M3 Duration","M3 Volume",
-                    "Quarter Duration","Quarter Volume"]].sort_values(by="Quarter Duration", ascending=False)
+    final = merged[["Task ID", "M1 Duration", "M1 Volume", "M2 Duration", "M2 Volume", "M3 Duration", "M3 Volume",
+                    "Quarter Duration", "Quarter Volume"]].sort_values(by="Quarter Duration", ascending=False)
     return final
 
 def _month_lbl(x) -> str:
@@ -282,16 +288,16 @@ def build_team_monthly_overview(df_all: pd.DataFrame, include_coverage: bool = T
         df = df[df["is_coverage"] == False]
 
     grp = (df.groupby(["task_id", "month_start"])
-           .agg(duration=("duration_minutes","sum"),
-                volume=("volume_value","sum"))
+           .agg(duration=("duration_minutes", "sum"),
+                volume=("volume_value", "sum"))
            .reset_index())
     if grp.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    grp["month_ts"]    = pd.to_datetime(grp["month_start"])
+    grp["month_ts"] = pd.to_datetime(grp["month_start"])
     grp["month_label"] = grp["month_ts"].apply(_month_lbl)
 
-    ordered_labels = [ _month_lbl(ts) for ts in sorted(grp["month_ts"].unique()) ]
+    ordered_labels = [_month_lbl(ts) for ts in sorted(grp["month_ts"].unique())]
 
     dur = grp.pivot(index="task_id", columns="month_label", values="duration").fillna(0)
     vol = grp.pivot(index="task_id", columns="month_label", values="volume").fillna(0)
@@ -306,7 +312,8 @@ def build_team_monthly_overview(df_all: pd.DataFrame, include_coverage: bool = T
         dur = dur.head(top_n)
         vol = vol.loc[dur.index]
 
-    dur.index.name = "Task ID"; vol.index.name = "Task ID"
+    dur.index.name = "Task ID"
+    vol.index.name = "Task ID"
     return dur, vol
 
 def build_team_quarterly_overview(df_all: pd.DataFrame, include_coverage: bool = True,
@@ -333,13 +340,13 @@ def build_team_quarterly_overview(df_all: pd.DataFrame, include_coverage: bool =
         return pd.DataFrame(), pd.DataFrame()
 
     grp = (base.groupby(["task_id", "month_start"])
-           .agg(duration=("duration_minutes","sum"),
-                volume=("volume_value","sum"))
+           .agg(duration=("duration_minutes", "sum"),
+                volume=("volume_value", "sum"))
            .reset_index())
-    grp["month_ts"]    = pd.to_datetime(grp["month_start"])
+    grp["month_ts"] = pd.to_datetime(grp["month_start"])
     grp["month_label"] = grp["month_ts"].apply(_month_lbl)
 
-    ordered_labels = [ _month_lbl(ts) for ts in sorted(grp["month_ts"].unique()) ]
+    ordered_labels = [_month_lbl(ts) for ts in sorted(grp["month_ts"].unique())]
     dur = grp.pivot(index="task_id", columns="month_label", values="duration").fillna(0)
     vol = grp.pivot(index="task_id", columns="month_label", values="volume").fillna(0)
 
@@ -354,7 +361,8 @@ def build_team_quarterly_overview(df_all: pd.DataFrame, include_coverage: bool =
     dur = dur.reindex(columns=ordered_labels + ([c for c in dur.columns if c not in ordered_labels]))
     vol = vol.reindex(columns=ordered_labels + ([c for c in vol.columns if c not in ordered_labels]))
 
-    dur.index.name = "Task ID"; vol.index.name = "Task ID"
+    dur.index.name = "Task ID"
+    vol.index.name = "Task ID"
     return dur, vol
 
 # ---------- Team Highlights helpers ----------
@@ -368,9 +376,9 @@ def build_team_over_threshold(df_all: pd.DataFrame, period_key: str,
         df = df[df["is_coverage"] == False]
 
     grp = (df.groupby([period_key, "task_id"])
-           .agg(duration=("duration_minutes","sum"),
-                volume=("volume_value","sum"),
-                members=("member","nunique"))
+           .agg(duration=("duration_minutes", "sum"),
+                volume=("volume_value", "sum"),
+                members=("member", "nunique"))
            .reset_index())
 
     over = grp[grp["duration"] > threshold_minutes].copy()
@@ -378,11 +386,11 @@ def build_team_over_threshold(df_all: pd.DataFrame, period_key: str,
         period_key: "Period Start",
         "task_id": "Task ID",
         "duration": "Total Duration (min)",
-        "volume":   "Total Volume",
-        "members":  "Members involved"
+        "volume": "Total Volume",
+        "members": "Members involved"
     }).sort_values(by="Total Duration (min)", ascending=False)
 
-    return over[["Task ID","Period Start","Total Duration (min)","Total Volume","Members involved"]]
+    return over[["Task ID", "Period Start", "Total Duration (min)", "Total Volume", "Members involved"]]
 
 def build_team_top_volume(df_all: pd.DataFrame, period_key: str, top_n: int = 10, include_coverage: bool = True) -> pd.DataFrame:
     """
@@ -395,11 +403,11 @@ def build_team_top_volume(df_all: pd.DataFrame, period_key: str, top_n: int = 10
     grp = (df.groupby([period_key, "task_id"])
            .agg(total_volume=("volume_value", "sum"),
                 total_duration=("duration_minutes", "sum"),
-                members=("member","nunique"))
+                members=("member", "nunique"))
            .reset_index())
 
     if grp.empty:
-        return pd.DataFrame(columns=["Task ID","Period Start","Total Volume","Total Duration (min)","Members involved"])
+        return pd.DataFrame(columns=["Task ID", "Period Start", "Total Volume", "Total Duration (min)", "Members involved"])
 
     top = (grp.sort_values("total_volume", ascending=False)
               .head(top_n)
@@ -411,7 +419,7 @@ def build_team_top_volume(df_all: pd.DataFrame, period_key: str, top_n: int = 10
                   "members": "Members involved"
               }))
 
-    return top[["Task ID","Period Start","Total Volume","Total Duration (min)","Members involved"]]
+    return top[["Task ID", "Period Start", "Total Volume", "Total Duration (min)", "Members involved"]]
 
 # ------------------------------------------------------------
 # Data I/O
@@ -457,15 +465,15 @@ with tab_upload:
                     st.stop()
 
                 # Normalize fields
-                raw["Task Type"]   = raw["Task Type"].astype(str).str.strip().str.title()
-                raw["Day"]         = raw["Day"].astype(str).str.strip().str.title()
+                raw["Task Type"] = raw["Task Type"].astype(str).str.strip().str.title()
+                raw["Day"] = raw["Day"].astype(str).str.strip().str.title()
                 raw["Team Member"] = raw["Team Member"].astype(str).str.strip()
-                raw["Task ID"]     = raw["Task ID"].astype(str).str.strip()
+                raw["Task ID"] = raw["Task ID"].astype(str).str.strip()
                 raw["Task Description"] = raw["Task Description"].astype(str).str.strip()
 
                 # Parse duration & volume
                 raw["duration_minutes"] = raw["Duration"].apply(parse_duration_any) if "Duration" in raw.columns else 0
-                vpairs = raw["Volume"].apply(parse_volume) if "Volume" in raw.columns else [(0, None)]*len(raw)
+                vpairs = raw["Volume"].apply(parse_volume) if "Volume" in raw.columns else [(0, None)] * len(raw)
                 raw["volume_value"] = [p[0] for p in vpairs]
                 raw["volume_label"] = [p[1] for p in vpairs]
 
@@ -489,9 +497,9 @@ with tab_upload:
 
                 # Persist normalized fields (keep both task_id and task_name)
                 out_cols = [
-                    "date","week_start","month_start","quarter_start",
-                    "member","task_id","task_name","task_type","is_coverage",
-                    "task_count","duration_minutes","volume_value","volume_label","source_file"
+                    "date", "week_start", "month_start", "quarter_start",
+                    "member", "task_id", "task_name", "task_type", "is_coverage",
+                    "task_count", "duration_minutes", "volume_value", "volume_label", "source_file"
                 ]
                 for c in out_cols:
                     if c not in df.columns:
@@ -522,9 +530,9 @@ with tab_dash:
     # Filters
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        period = st.selectbox("Period", ["Weekly","Monthly","Quarterly"])
+        period = st.selectbox("Period", ["Weekly", "Monthly", "Quarterly"])
     with c2:
-        view = st.selectbox("View", ["Team","Individual"])
+        view = st.selectbox("View", ["Team", "Individual"])
     with c3:
         member_sel = None
         if view == "Individual":
@@ -537,7 +545,7 @@ with tab_dash:
     include_coverage = True if view == "Individual" else st.checkbox("Include Coverage (Team)", value=include_coverage_default)
 
     # Period key & optional picker
-    period_key = {"Weekly":"week_start","Monthly":"month_start","Quarterly":"quarter_start"}[period]
+    period_key = {"Weekly": "week_start", "Monthly": "month_start", "Quarterly": "quarter_start"}[period]
     d = data.copy()
     if view == "Individual" and member_sel:
         d = d[d["member"] == member_sel]
@@ -546,6 +554,7 @@ with tab_dash:
 
     # Completed period mask
     today = pd.Timestamp.today().date()
+
     def completed_mask(dframe, key):
         if key == "month_start":
             current_month_start = pd.Timestamp(today).to_period("M").start_time.date()
@@ -565,7 +574,7 @@ with tab_dash:
     pick_specific = st.checkbox("Pick a specific period", value=False)
     chosen_period = None
     if pick_specific and available_periods:
-        chosen_period = st.selectbox("Select period", available_periods, index=len(available_periods)-1)
+        chosen_period = st.selectbox("Select period", available_periods, index=len(available_periods) - 1)
         d = d[d[period_key] == chosen_period]
 
     # Aggregations (for KPIs/totals when shown)
@@ -585,11 +594,11 @@ with tab_dash:
             label = f"Month: {pd.to_datetime(chosen_period).strftime('%B %Y')}"
         else:
             qdt = pd.to_datetime(chosen_period)
-            q = (qdt.month-1)//3 + 1
+            q = (qdt.month - 1) // 3 + 1
             label = f"Quarter: Q{q} {qdt.year}"
 
     st.markdown(f"**{view} — {period} — {label}**")
-    if period in ["Monthly","Quarterly"] and not only_completed and not pick_specific:
+    if period in ["Monthly", "Quarterly"] and not only_completed and not pick_specific:
         st.caption("Showing current period as MTD/QTD until the period completes.")
 
     # --- KPI + totals shown only for Weekly OR Individual views ---
@@ -598,13 +607,13 @@ with tab_dash:
     if show_kpis_and_totals:
         k1, k2, k3 = st.columns(3)
         k1.metric("Total Tasks", int(agg["task_count"].sum()))
-        k2.metric("Total Duration (hrs)", round(agg["duration_minutes"].sum()/60, 1))
+        k2.metric("Total Duration (hrs)", round(agg["duration_minutes"].sum() / 60, 1))
         k3.metric("Avg Duration per Task (min)", round(agg["avg_duration_per_task"].mean(), 1))
 
         st.write("Totals per period")
         st.dataframe(agg, use_container_width=True)
 
-        split = d.groupby([period_key, "task_type"]).agg({"task_count":"sum"}).reset_index()
+        split = d.groupby([period_key, "task_type"]).agg({"task_count": "sum"}).reset_index()
         st.write("Split by task type (Production vs Coverage)")
         st.dataframe(
             split.pivot(index=period_key, columns="task_type", values="task_count").fillna(0),
@@ -730,92 +739,6 @@ with tab_dash:
                 st.caption("Volume by month")
                 st.dataframe(vol_mat, use_container_width=True)
                 st.download_button(
-                    "Download Volume Matrix (CSV)",
-                    data=vol_mat.to_csv(),
-                    file_name=f"Team_{period}_TaskID_Volume_Matrix.csv",
-                    mime="text/csv"
-                )
-
-    # --------------------------------------------------------
-    # Weekly → Individual layout (preserve & show descriptions)
-    # --------------------------------------------------------
-    if period == "Weekly" and view == "Individual" and member_sel:
-        st.markdown("### ✅ Task Summary for the Week")
-        wsel = d  # already filtered by member & possibly specific week
-        unique_tasks = wsel.drop_duplicates(subset=["task_name"])
-        if unique_tasks.empty:
-            st.info("No tasks for this team member.")
-        else:
-            for _, row in unique_tasks[["task_name"]].iterrows():
-                desc = escape_md(row["task_name"]) if pd.notna(row["task_name"]) else "(No Description)"
-                st.markdown(f"- **{desc}**")
-
-        st.markdown("### 📋 Raw Data (Production Tasks Only)")
-        prod = wsel[wsel["task_type"] == "Production"]
-        if not prod.empty:
-            display = prod[["task_name","task_type","date","duration_minutes","volume_value","volume_label"]].copy()
-            display["task_type"] = display["task_type"].str.capitalize()
-            display = display.rename(columns={
-                "task_name":"Task Description",
-                "date":"Date",
-                "duration_minutes":"Duration (min)",
-                "volume_value":"Volume",
-                "volume_label":"Volume Label",
-            })
-            st.dataframe(display, use_container_width=True)
-            st.download_button(
-                label="Download Filtered Data (Production)",
-                data=display.to_csv(index=False),
-                file_name=f"{member_sel}_ProductionTasks.csv",
-                mime="text/csv"
-            )
-        else:
-            st.write("No production tasks.")
-
-        st.markdown("### 🛡 Coverage Tasks")
-        coverage = (
-            wsel[wsel["task_type"] == "Coverage"]
-            .drop_duplicates(subset=["task_name"])[["task_name"]]
-            .rename(columns={"task_name":"Task Description"})
-        )
-        if not coverage.empty:
-            st.dataframe(coverage, use_container_width=True)
-            st.download_button(
-                label="Download Coverage Task Names",
-                data=coverage.to_csv(index=False),
-                file_name=f"{member_sel}_CoverageTasks.csv",
-                mime="text/csv"
-            )
-        else:
-            st.write("No coverage tasks.")
-
-        st.markdown("### ⚙ Production Summary")
-        if not prod.empty:
-            prod["Day"] = pd.to_datetime(prod["date"]).dt.day_name()
-            summary = (
-                prod.groupby("Day")
-                .agg(
-                    Production_Tasks=("task_count", "sum"),
-                    Total_Duration=("duration_minutes", "sum")
-                )
-                .reset_index()
-            )
-            summary["Day"] = pd.Categorical(summary["Day"], categories=DAY_ORDER, ordered=True)
-            summary = summary.sort_values("Day")
-            st.dataframe(summary, use_container_width=True)
-               else:
-                   st.write("No production tasks.")
-
- # Coverage tasks (names only; still show description here)
-        st.markdown("### 🛡 Coverage Tasks")
-        coverage = (
-            wsel[wsel["task_type"] == "Coverage"]
-            .drop_duplicates(subset=["task_id","task_name"])[["task_id","task_name"]]
-            .rename(columns={"task_id":"Task ID","task_name":"Task Description"})
-        )
-        if not coverage.empty:
-            st.dataframe(coverage, use_container_width=True)
-            st.download_button(
                 label="Download Coverage Tasks",
                 data=coverage.to_csv(index=False),
                 file_name=f"{member_sel}_CoverageTasks.csv",
