@@ -418,7 +418,7 @@ with tab_dash:
                 )
                 .reset_index()
             )
-            summary["Day"] = pd            summary["Day"] = pd.Categorical(summary["Day"], categories=DAY_ORDER, ordered=True)
+            summary["Day"] = pd.Categorical(summary["Day"], categories=DAY_ORDER, ordered=True)
             summary = summary.sort_values("Day")
             st.dataframe(summary, use_container_width=True)
         else:
