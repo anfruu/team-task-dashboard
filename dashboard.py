@@ -744,8 +744,6 @@ with tab_dash:
                 file_name=f"{member_sel}_CoverageTasks.csv",
                 mime="text/csv"
             )
-        else:
-            st.write("No coverage tasks.")
 
  # Day-by-day production summary
         st.markdown("### ⚙ Production Summary")
