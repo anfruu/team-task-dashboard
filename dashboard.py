@@ -15,6 +15,9 @@ import numpy as np
 from sqlalchemy import create_engine
 from sqlalchemy import text
 
+# --- Admin Config ---
+ADMIN_PIN = os.environ.get("ADMIN_PIN", "1234")
+
 
 def get_engine():
     db_url = os.environ.get("DATABASE_URL")
