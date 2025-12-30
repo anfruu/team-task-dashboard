@@ -917,7 +917,7 @@ with _tab_dash:
 
         # ---- Day-by-day production summary (Team / Individual) ----
         def render_day_by_day_prod(df_in: pd.DataFrame, title: str):
-            st.markdown(f'### {title}")
+            st.markdown(f"### {title}")
             prod = df_in[df_in["is_coverage"] == False].copy()
             if not prod.empty:
                 prod["DayName"] = pd.to_datetime(prod["date"], errors="coerce").dt.day_name()
