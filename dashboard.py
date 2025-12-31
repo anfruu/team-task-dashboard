@@ -589,8 +589,14 @@ def clear_all_rows():
         st.error("DATABASE_URL missing; cannot clear data.")
         st.stop()
 
+def drop_ops_tasks_table():
+    """DROP the ops_tasks table completely (schema + rows)."""
+    if engine is None:
+        st.error("DATABASE_URL missing; cannot drop table.")
+        st.stop()
+
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM ops_tasks"))
+        conn.execute(text("DROP TABLE IF EXISTS ops_tasks"))
 
 
 # -------------------------- App Layout: Dashboard + Admin Upload --------------------------
@@ -607,15 +613,34 @@ with _tab_upload:
         st.markdown("---")
         st.subheader("Danger Zone")
 
-        confirm_clear = st.checkbox("I understand this will permanently delete ALL uploaded rows.", value=False)
-
-        if st.button("CLEAR ALL DATA (Reset Dashboard)", disabled=not confirm_clear):
+        # ===== Option A: Clear rows only (keeps schema) ====
+        confirm_clear = st.checkbox(
+            "I understand this will permanently delete ALL uploaded rows (table stays).",
+            value=False
+            key="confirm_clear_rows",
+        )
+        if st.button("CLEAR ALL DATA (Keep Table)", disabled=not confirm_clear, key="btn_clear_rows"):
             clear_all_rows()
-            st.success("ALL rows cleared. Dashboard is now empty.")
+            st.success("All rows cleared. Dashboard is now empty.")
             st.cache_data.clear()
             st.rerun()
 
         st.markdown("---")
+
+        # ===== Option B: DROP table (resets schema) =====
+        confirm_drop = st.checkbox(
+            "I understand this will DROP the ops_tasks table (schema reset). Use if uploads fail.",
+            value=False,
+            key="confirm_drop_table",
+        )
+        if st.button("DROP ops_tasks TABLE (Schema Reset)", disabled=not confirm_drop, key="btn_drop_table"):
+            drop_ops_tasks_table()
+            st.success("ops_tasks table dropped. Next upload will recreate it with the correct columns.")
+            st.cache_data.clear()
+            st.rerun()
+
+        st.markdown("---")
+
         uploaded = st.file_uploader("Upload Combined Excel File (.xlsx)", type=["xlsx"])
         source_label = st.text_input("Optional: Source label (e.g., 'Week ending 2025-12-19')")
 
