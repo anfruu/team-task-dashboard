@@ -616,7 +616,7 @@ with _tab_upload:
         # ===== Option A: Clear rows only (keeps schema) ====
         confirm_clear = st.checkbox(
             "I understand this will permanently delete ALL uploaded rows (table stays).",
-            value=False
+            value=False,
             key="confirm_clear_rows",
         )
         if st.button("CLEAR ALL DATA (Keep Table)", disabled=not confirm_clear, key="btn_clear_rows"):
