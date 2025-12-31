@@ -22,6 +22,8 @@ ADMIN_PIN = os.environ.get("ADMIN_PIN", "1234")
 def get_engine():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
+        st.warning("DATABASE_URL is not set. Dashboard will load empty until data is uploaded.")
+        return None
         st.error("DATABASE_URL is not set in Render environment variables.")
         st.stop()
 
@@ -30,6 +32,8 @@ def get_engine():
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
     return create_engine(db_url, pool_pre_ping=True)
+
+engine = get_engine()
 
 def list_public_tables(engine):
     sql = text("""
@@ -586,7 +590,7 @@ def clear_all_rows():
         st.stop()
 
     with engine.begin() as conn:
-        conn.execute("DELETE FROM ops_tasks")
+        conn.execute(text("DELETE FROM ops_tasks"))
 
 
 # -------------------------- App Layout: Dashboard + Admin Upload --------------------------
