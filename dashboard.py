@@ -188,9 +188,9 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns:
             out[c] = out[c].apply(_clean_str)
 
-    # Volume numeric
+    # Volume: keep EXACTLY what the user typed (numbers OR text)
     if "volume" in out.columns:
-        out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0).astype(int)
+        out["volume"] = out["volume"].apply(_clean_str)
 
     # Drop blanks
     if "task_id" in out.columns:
