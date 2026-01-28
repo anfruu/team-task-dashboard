@@ -190,7 +190,7 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Volume: keep EXACTLY what the user typed (numbers OR text)
     if "volume" in out.columns:
-        out["volume"] = out["volume"].apply(_clean_str)
+        out["volume"] = out["volume"].astype(str).str.strip()
 
     # Drop blanks
     if "task_id" in out.columns:
@@ -283,7 +283,7 @@ def init_db():
                 task_type TEXT,
                 role_type TEXT,
                 duration_seconds INTEGER,
-                volume INTEGER,
+                volume TEXT,
                 day TEXT,
                 week_ending TEXT,
                 uploaded_at TEXT
@@ -311,7 +311,7 @@ def init_db():
                 task_type TEXT,
                 role_type TEXT,
                 duration_seconds INTEGER,
-                volume INTEGER,
+                volume TEXT,
                 day TEXT,
                 week_ending TEXT,
                 uploaded_at TIMESTAMP DEFAULT NOW()
@@ -531,11 +531,16 @@ with tabs[0]:
         st.info("No coverage entries for this week.")
     else:
         cov_view = df_cov[["task_id", "volume"]].copy()
+
         cov_view["task_id"] = cov_view["task_id"].fillna("").astype(str)
-        cov_grouped = cov_view.groupby("task_id", as_index=False).agg({"volume": "sum"})
-        # Only show volume if > 0 (your requirement: "if they put volume")
-        cov_grouped["volume"] = cov_grouped["volume"].fillna(0).astype(int)
-        st.dataframe(cov_grouped, use_container_width=True, hide_index=True)
+        cov_view["volume"] = cov_view["volume"].fillna("").astype(str)
+
+        st.dataframe(
+            cov_view,
+            use_container_width=True,
+            hide_index=True
+        )
+
 
     # -------------------------
     # Raw data (non coverage): Task ID, Duration hh:mm:ss, Volume, Day
