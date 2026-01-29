@@ -1,108 +1,125 @@
+# dashboard.py
+# MAO Workflow Tracker Dashboard (Streamlit)
+# - Weekly / Monthly / Quarterly / Admin Upload tabs (layout preserved)
+# - Volume is NUMERIC ONLY (INTEGER everywhere). Any non-numeric volume becomes 0 on upload.
+# - Weekly adds: Task Summary rename, Coverage day column, Production (Primary) rename + day filter,
+#   and Production (Backup) section.
+
 import os
 import re
-from datetime import datetime
-from typing import List, Optional, Tuple
+from io import BytesIO
+from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
 # -----------------------------
-# Page / Layout (DO NOT TOUCH)
+# App config (do not change title/layout)
 # -----------------------------
 st.set_page_config(page_title="MAO Workflow Tracker Dashboard", layout="wide")
 st.title("MAO Workflow Tracker Dashboard")
 st.caption("LPL Financial – Operations")
 
 # -----------------------------
-# DB CONFIG
+# DB / Engine
 # -----------------------------
-def get_engine():
-    """
-    Uses:
-      - Render Postgres via DATABASE_URL
-      - falls back to local sqlite dashboard.db
-    """
-    db_url = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-    if not db_url:
-        return create_engine("sqlite:///dashboard.db", future=True)
+if not DATABASE_URL:
+    st.error(
+        "DATABASE_URL is not set. Add it in Render Environment variables.\n\n"
+        "Example: postgresql+psycopg2://USER:PASSWORD@HOST:PORT/DBNAME?sslmode=require"
+    )
+    st.stop()
 
-    # Render commonly provides postgres://; SQLAlchemy wants postgresql://
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
+ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-    # Force SSL for Render
-    connect_args = {"sslmode": "require"}
-    return create_engine(db_url, future=True, connect_args=connect_args)
+IS_SQLITE = ENGINE.dialect.name == "sqlite"
 
-ENGINE = get_engine()
 
 # -----------------------------
-# HELPERS
+# Helpers
 # -----------------------------
+def _clean_str(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def duration_to_seconds(val) -> int:
+    """Accepts hh:mm:ss, mm:ss, numeric seconds, or blanks; returns int seconds."""
+    if pd.isna(val):
+        return 0
+    s = str(val).strip()
+    if not s:
+        return 0
+
+    # If it's numeric-ish, treat as seconds
+    try:
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            return max(0, int(float(s)))
+    except Exception:
+        pass
+
+    # Time format
+    parts = s.split(":")
+    try:
+        parts = [int(float(p)) for p in parts]
+    except Exception:
+        return 0
+
+    if len(parts) == 3:
+        h, m, sec = parts
+        return max(0, h * 3600 + m * 60 + sec)
+    if len(parts) == 2:
+        m, sec = parts
+        return max(0, m * 60 + sec)
+
+    return 0
+
+
+def seconds_to_hhmmss(seconds: int) -> str:
+    try:
+        seconds = int(seconds)
+    except Exception:
+        seconds = 0
+    seconds = max(0, seconds)
+    hh = seconds // 3600
+    mm = (seconds % 3600) // 60
+    ss = seconds % 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-def clean_str(x) -> str:
-    if x is None:
-        return ""
-    s = str(x).strip()
-    # Normalize weird whitespace
-    s = re.sub(r"\s+", " ", s)
-    return s
 
-def parse_volume_num(vol) -> Optional[float]:
-    """
-    Accepts:
-      - 222
-      - "222 emails"
-      - "16 accts"
-      - "0 accounts"
-      - "" / None -> None
-    Returns numeric (float) or None if no number present.
-    """
-    if vol is None:
-        return None
-    s = str(vol).strip()
-    if not s:
-        return None
-
-    # Grab first number (int or decimal)
-    m = re.search(r"[-+]?\d*\.?\d+", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(0))
-    except Exception:
-        return None
-
-def ensure_day_sort(df: pd.DataFrame, day_col: str = "day") -> pd.DataFrame:
-    if day_col not in df.columns:
-        return df
-    df = df.copy()
-    df[day_col] = df[day_col].astype(str)
-    df["day_sort"] = df[day_col].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
-    df = df.sort_values(["day_sort"] + [c for c in df.columns if c not in ("day_sort",)])
-    df = df.drop(columns=["day_sort"])
-    return df
-
-# -----------------------------
-# NORMALIZATION (Excel -> canonical)
-# -----------------------------
 def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Expected from combined Tasks sheet:
+    Expected from combined Tasks sheet (your screenshot):
       Task ID, Team Member, Task Description, Task Type, Role Type,
       Duration Seconds, Duration Minutes, Duration Hours, Volume, Day, Week Ending
+    Canonical:
+      task_id, team_member, task_description, task_type, role_type,
+      duration_seconds, volume, day, week_ending
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "task_id","team_member","task_description","task_type","role_type",
-            "duration_seconds","volume_text","volume_num","day","week_ending"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "task_id",
+                "team_member",
+                "task_description",
+                "task_type",
+                "role_type",
+                "duration_seconds",
+                "volume",
+                "day",
+                "week_ending",
+            ]
+        )
 
     df = df.copy()
-    df.columns = [clean_str(c) for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
     colmap = {
         "Task ID": "task_id",
@@ -111,7 +128,10 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
         "Task Type": "task_type",
         "Role Type": "role_type",
         "Duration Seconds": "duration_seconds",
-        "Volume": "volume_text",
+        "Duration Minutes": "duration_minutes",
+        "Duration Hours": "duration_hours",
+        "Duration": "duration_raw",  # legacy
+        "Volume": "volume",
         "Day": "day",
         "Week Ending": "week_ending",
     }
@@ -120,38 +140,70 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
     for src, dst in colmap.items():
         if src in df.columns:
             out[dst] = df[src]
-        else:
-            out[dst] = None
+
+    # Build duration_seconds if missing
+    if "duration_seconds" not in out.columns and "duration_raw" in out.columns:
+        out["duration_seconds"] = out["duration_raw"].apply(duration_to_seconds)
+
+    if "duration_seconds" not in out.columns:
+        # Try minutes/hours
+        sec = 0
+        if "duration_minutes" in out.columns:
+            sec = pd.to_numeric(out["duration_minutes"], errors="coerce").fillna(0) * 60
+        if "duration_hours" in out.columns:
+            sec = sec + pd.to_numeric(out["duration_hours"], errors="coerce").fillna(0) * 3600
+        out["duration_seconds"] = sec
 
     # Clean strings
-    for c in ["task_id","team_member","task_description","task_type","role_type","day","week_ending"]:
-        out[c] = out[c].apply(clean_str)
+    for c in ["task_id", "team_member", "task_description", "task_type", "role_type", "day", "week_ending"]:
+        if c in out.columns:
+            out[c] = out[c].apply(_clean_str)
 
-    # Duration seconds numeric (keep missing as 0)
+    # Volume: NUMERIC ONLY
+    if "volume" in out.columns:
+        out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0).astype(int)
+    else:
+        out["volume"] = 0
+
+    # Ensure required columns exist
+    for c in [
+        "task_id",
+        "team_member",
+        "task_description",
+        "task_type",
+        "role_type",
+        "duration_seconds",
+        "volume",
+        "day",
+        "week_ending",
+    ]:
+        if c not in out.columns:
+            out[c] = "" if c in ["task_id", "team_member", "task_description", "task_type", "role_type", "day", "week_ending"] else 0
+
+    # Duration seconds numeric int
     out["duration_seconds"] = pd.to_numeric(out["duration_seconds"], errors="coerce").fillna(0).astype(int)
 
-    # Volume: keep what user typed + extract numeric for metrics
-    out["volume_text"] = out["volume_text"].apply(lambda x: clean_str(x))
-    out["volume_num"] = out["volume_text"].apply(parse_volume_num)
-
-    # Drop rows without task_id
-    out = out.dropna(subset=["task_id"])
-    out = out[out["task_id"].astype(str).str.strip() != ""]
+    # Drop blanks
+    out = out.dropna(subset=["task_id"]).copy()
+    out = out[out["task_id"].astype(str).str.strip() != ""].copy()
 
     return out
 
+
 def normalize_projects_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Expected from combined Projects sheet:
+    Expected from combined Projects sheet (your screenshot):
       Project Name, Owner, Start Date, End Date, Status, Days Active, Notes, Week Ending
+    Canonical:
+      project_name, owner, start_date, end_date, status, days_active, notes, week_ending
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "project_name","owner","start_date","end_date","status","days_active","notes","week_ending"
-        ])
+        return pd.DataFrame(
+            columns=["project_name", "owner", "start_date", "end_date", "status", "days_active", "notes", "week_ending"]
+        )
 
     df = df.copy()
-    df.columns = [clean_str(c) for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
     colmap = {
         "Project Name": "project_name",
@@ -166,163 +218,304 @@ def normalize_projects_df(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
     for src, dst in colmap.items():
-        out[dst] = df[src] if src in df.columns else None
+        if src in df.columns:
+            out[dst] = df[src]
 
-    for c in ["project_name","owner","status","notes","week_ending"]:
-        out[c] = out[c].apply(clean_str)
+    for c in ["project_name", "owner", "status", "notes", "week_ending"]:
+        if c in out.columns:
+            out[c] = out[c].apply(_clean_str)
 
-    # Dates can stay as text; Days Active should be numeric
-    out["start_date"] = out["start_date"].apply(lambda x: clean_str(x))
-    out["end_date"] = out["end_date"].apply(lambda x: clean_str(x))
-    out["days_active"] = pd.to_numeric(out["days_active"], errors="coerce").fillna(0).astype(int)
+    # Dates: keep as string (consistent with your current approach)
+    for c in ["start_date", "end_date"]:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda x: "" if pd.isna(x) else str(x))
 
-    out = out.dropna(subset=["project_name"])
-    out = out[out["project_name"].astype(str).str.strip() != ""]
+    # Days active
+    if "days_active" in out.columns:
+        out["days_active"] = pd.to_numeric(out["days_active"], errors="coerce").fillna(0).astype(int)
+    else:
+        out["days_active"] = 0
+
+    # Drop blanks
+    out = out.dropna(subset=["project_name"]).copy()
+    out = out[out["project_name"].astype(str).str.strip() != ""].copy()
 
     return out
 
+
 # -----------------------------
-# DB INIT
+# DB init
 # -----------------------------
 def init_db():
-    """
-    Creates tables if they don't exist.
-    Volume stored as:
-      - volume_text TEXT (whatever user typed)
-      - volume_num DOUBLE PRECISION (parsed number)
-    """
     with ENGINE.begin() as conn:
-        dialect = ENGINE.dialect.name.lower()
-
-        if dialect == "sqlite":
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT,
-                    team_member TEXT,
-                    task_description TEXT,
-                    task_type TEXT,
-                    role_type TEXT,
-                    duration_seconds INTEGER,
-                    volume_text TEXT,
-                    volume_num REAL,
-                    day TEXT,
-                    week_ending TEXT,
-                    uploaded_at TEXT
+        if IS_SQLITE:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS tasks (
+                      task_id TEXT,
+                      team_member TEXT,
+                      task_description TEXT,
+                      task_type TEXT,
+                      role_type TEXT,
+                      duration_seconds INTEGER,
+                      volume INTEGER,
+                      day TEXT,
+                      week_ending TEXT,
+                      uploaded_at TEXT
+                    )
+                    """
                 )
-            """))
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    project_name TEXT,
-                    owner TEXT,
-                    start_date TEXT,
-                    end_date TEXT,
-                    status TEXT,
-                    days_active INTEGER,
-                    notes TEXT,
-                    week_ending TEXT,
-                    uploaded_at TEXT
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS projects (
+                      project_name TEXT,
+                      owner TEXT,
+                      start_date TEXT,
+                      end_date TEXT,
+                      status TEXT,
+                      days_active INTEGER,
+                      notes TEXT,
+                      week_ending TEXT,
+                      uploaded_at TEXT
+                    )
+                    """
                 )
-            """))
+            )
         else:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id BIGSERIAL PRIMARY KEY,
-                    task_id TEXT,
-                    team_member TEXT,
-                    task_description TEXT,
-                    task_type TEXT,
-                    role_type TEXT,
-                    duration_seconds INTEGER,
-                    volume_text TEXT,
-                    volume_num DOUBLE PRECISION,
-                    day TEXT,
-                    week_ending TEXT,
-                    uploaded_at TIMESTAMP DEFAULT NOW()
+            # Postgres
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS tasks (
+                      task_id TEXT,
+                      team_member TEXT,
+                      task_description TEXT,
+                      task_type TEXT,
+                      role_type TEXT,
+                      duration_seconds INTEGER,
+                      volume INTEGER,
+                      day TEXT,
+                      week_ending TEXT,
+                      uploaded_at TIMESTAMP DEFAULT NOW()
+                    )
+                    """
                 )
-            """))
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id BIGSERIAL PRIMARY KEY,
-                    project_name TEXT,
-                    owner TEXT,
-                    start_date TEXT,
-                    end_date TEXT,
-                    status TEXT,
-                    days_active INTEGER,
-                    notes TEXT,
-                    week_ending TEXT,
-                    uploaded_at TIMESTAMP DEFAULT NOW()
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS projects (
+                      project_name TEXT,
+                      owner TEXT,
+                      start_date TEXT,
+                      end_date TEXT,
+                      status TEXT,
+                      days_active INTEGER,
+                      notes TEXT,
+                      week_ending TEXT,
+                      uploaded_at TIMESTAMP DEFAULT NOW()
+                    )
+                    """
                 )
-            """))
+            )
+
+            # Optional indexes
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_member_week ON tasks(team_member, week_ending)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_projects_owner_week ON projects(owner, week_ending)"))
+
 
 init_db()
 
+
 # -----------------------------
-# QUERY HELPERS
+# DB fetch helpers
 # -----------------------------
-def list_members() -> List[str]:
+def list_team_members() -> List[str]:
     with ENGINE.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT DISTINCT team_member
-            FROM tasks
-            WHERE team_member IS NOT NULL AND team_member <> ''
-            ORDER BY team_member
-        """)).fetchall()
+        rows = conn.execute(
+            text(
+                """
+                SELECT DISTINCT team_member
+                FROM tasks
+                WHERE team_member IS NOT NULL AND team_member <> ''
+                ORDER BY team_member
+                """
+            )
+        ).fetchall()
     return [r[0] for r in rows]
+
 
 def list_weeks_for_member(member: str) -> List[str]:
     with ENGINE.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT DISTINCT week_ending
-            FROM tasks
-            WHERE team_member = :m
-              AND week_ending IS NOT NULL AND week_ending <> ''
-            ORDER BY week_ending DESC
-        """), {"m": member}).fetchall()
+        rows = conn.execute(
+            text(
+                """
+                SELECT DISTINCT week_ending
+                FROM tasks
+                WHERE team_member = :m
+                  AND week_ending IS NOT NULL AND week_ending <> ''
+                ORDER BY week_ending DESC
+                """
+            ),
+            {"m": member},
+        ).fetchall()
     return [r[0] for r in rows]
+
 
 def fetch_week_tasks(member: str, week_ending: str) -> pd.DataFrame:
     with ENGINE.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT task_id, team_member, task_description, task_type, role_type,
-                   duration_seconds, volume_text, volume_num, day, week_ending
-            FROM tasks
-            WHERE team_member = :m AND week_ending = :w
-        """), {"m": member, "w": week_ending}).fetchall()
+        rows = conn.execute(
+            text(
+                """
+                SELECT task_id, team_member, task_description, task_type, role_type,
+                       duration_seconds, volume, day, week_ending
+                FROM tasks
+                WHERE team_member = :m AND week_ending = :w
+                """
+            ),
+            {"m": member, "w": week_ending},
+        ).fetchall()
 
-    return pd.DataFrame(rows, columns=[
-        "task_id","team_member","task_description","task_type","role_type",
-        "duration_seconds","volume_text","volume_num","day","week_ending"
-    ])
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "task_id",
+            "team_member",
+            "task_description",
+            "task_type",
+            "role_type",
+            "duration_seconds",
+            "volume",
+            "day",
+            "week_ending",
+        ],
+    )
+    if not df.empty:
+        df["duration_hhmmss"] = df["duration_seconds"].apply(seconds_to_hhmmss)
+    return df
+
 
 def fetch_week_projects(owner: str, week_ending: str) -> pd.DataFrame:
     with ENGINE.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT project_name, owner, start_date, end_date, status, days_active, notes, week_ending
-            FROM projects
-            WHERE owner = :o AND week_ending = :w
-        """), {"o": owner, "w": week_ending}).fetchall()
+        rows = conn.execute(
+            text(
+                """
+                SELECT project_name, owner, start_date, end_date, status, days_active, notes, week_ending
+                FROM projects
+                WHERE owner = :o AND week_ending = :w
+                """
+            ),
+            {"o": owner, "w": week_ending},
+        ).fetchall()
 
-    return pd.DataFrame(rows, columns=[
-        "project_name","owner","start_date","end_date","status","days_active","notes","week_ending"
-    ])
+    return pd.DataFrame(
+        rows,
+        columns=["project_name", "owner", "start_date", "end_date", "status", "days_active", "notes", "week_ending"],
+    )
+
 
 # -----------------------------
-# UI: Tabs (KEEP ORDER)
+# Upload / overwrite helpers
+# -----------------------------
+def delete_week_data(week_ending: str):
+    with ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM tasks WHERE week_ending = :w"), {"w": week_ending})
+        conn.execute(text("DELETE FROM projects WHERE week_ending = :w"), {"w": week_ending})
+
+
+def insert_tasks(df: pd.DataFrame):
+    if df.empty:
+        return
+    with ENGINE.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO tasks (task_id, team_member, task_description, task_type, role_type,
+                                       duration_seconds, volume, day, week_ending, uploaded_at)
+                    VALUES (:task_id, :team_member, :task_description, :task_type, :role_type,
+                            :duration_seconds, :volume, :day, :week_ending, :uploaded_at)
+                    """
+                    if IS_SQLITE
+                    else
+                    """
+                    INSERT INTO tasks (task_id, team_member, task_description, task_type, role_type,
+                                       duration_seconds, volume, day, week_ending)
+                    VALUES (:task_id, :team_member, :task_description, :task_type, :role_type,
+                            :duration_seconds, :volume, :day, :week_ending)
+                    """
+                ),
+                {
+                    "task_id": r["task_id"],
+                    "team_member": r["team_member"],
+                    "task_description": r["task_description"],
+                    "task_type": r["task_type"],
+                    "role_type": r["role_type"],
+                    "duration_seconds": int(r["duration_seconds"]),
+                    "volume": int(r["volume"]),
+                    "day": r["day"],
+                    "week_ending": r["week_ending"],
+                    "uploaded_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+                },
+            )
+
+
+def insert_projects(df: pd.DataFrame):
+    if df.empty:
+        return
+    with ENGINE.begin() as conn:
+        for _, r in df.iterrows():
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO projects (project_name, owner, start_date, end_date, status,
+                                          days_active, notes, week_ending, uploaded_at)
+                    VALUES (:project_name, :owner, :start_date, :end_date, :status,
+                            :days_active, :notes, :week_ending, :uploaded_at)
+                    """
+                    if IS_SQLITE
+                    else
+                    """
+                    INSERT INTO projects (project_name, owner, start_date, end_date, status,
+                                          days_active, notes, week_ending)
+                    VALUES (:project_name, :owner, :start_date, :end_date, :status,
+                            :days_active, :notes, :week_ending)
+                    """
+                ),
+                {
+                    "project_name": r["project_name"],
+                    "owner": r["owner"],
+                    "start_date": r.get("start_date", ""),
+                    "end_date": r.get("end_date", ""),
+                    "status": r.get("status", ""),
+                    "days_active": int(r.get("days_active", 0)),
+                    "notes": r.get("notes", ""),
+                    "week_ending": r.get("week_ending", ""),
+                    "uploaded_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+                },
+            )
+
+
+# -----------------------------
+# UI: Tabs (do not change order/labels)
 # -----------------------------
 tabs = st.tabs(["Weekly", "Monthly", "Quarterly", "Admin Upload"])
 
-# -----------------------------
-# WEEKLY TAB
-# -----------------------------
+# =============================
+# Weekly Tab
+# =============================
 with tabs[0]:
-    members = list_members()
+    st.markdown("## Weekly View")
+
+    members = list_team_members()
     if not members:
-        st.info("No data yet. Upload a combined workbook in Admin Upload.")
+        st.info("No data yet. Please upload a combined workbook in Admin Upload.")
     else:
         sel_member = st.selectbox("Team Member", members, index=0)
+
         weeks = list_weeks_for_member(sel_member)
         if not weeks:
             st.info("No weeks found for this team member yet.")
@@ -330,118 +523,112 @@ with tabs[0]:
             sel_week = st.selectbox("Week Ending", weeks, index=0)
 
             df = fetch_week_tasks(sel_member, sel_week)
+            dfp = fetch_week_projects(sel_member, sel_week)
 
-            # Split:
-            # - Coverage: task_type == Coverage
-            # - Production: task_type == Production
-            df["task_type"] = df["task_type"].astype(str)
-            df["role_type"] = df["role_type"].astype(str)
+            # Standardize for comparisons
+            if not df.empty:
+                df["task_type_norm"] = df["task_type"].str.strip().str.lower()
+                df["role_type_norm"] = df["role_type"].str.strip().str.lower()
+                df["day"] = df["day"].astype(str).str.strip()
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(int)
 
-            df_cov = df[df["task_type"].str.lower() == "coverage"].copy()
-            df_prod = df[df["task_type"].str.lower() == "production"].copy()
-
-            # =========================================================
-            # 2) Task Summary (Unique Tasks) -> "Task Summary"
-            #    ONLY Production tasks, unique per week
-            # =========================================================
+            # -------------------------
+            # 2) Task Summary (Production tasks, unique)
+            # -------------------------
             st.markdown("### Task Summary")
-            summary = (
-                df_prod[["task_id", "task_description"]]
-                .dropna(subset=["task_id"])
-                .drop_duplicates()
-                .sort_values(["task_id"])
-            )
-            # Leave description blank if missing
-            summary["task_description"] = summary["task_description"].fillna("").astype(str)
 
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            if df.empty:
+                st.info("No task entries for this week.")
+            else:
+                df_prod = df[df["task_type_norm"] == "production"].copy()
 
-            # =========================================================
-            # 3) Coverage (add Day column, keep layout)
-            #    Columns: task_id, day, volume
-            #    Volume: show parsed numeric so monthly/quarterly work cleanly
-            # =========================================================
+                if df_prod.empty:
+                    st.info("No production entries for this week.")
+                else:
+                    summary = (
+                        df_prod[["task_id", "task_description"]]
+                        .drop_duplicates()
+                        .sort_values(["task_id"])
+                    )
+                    # Leave description blank if missing (already blank strings in your data)
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            # -------------------------
+            # 3) Coverage (add Day column)
+            # -------------------------
             st.markdown("### Coverage")
-            if df_cov.empty:
+
+            if df.empty:
                 st.info("No coverage entries for this week.")
             else:
-                cov_view = df_cov[["task_id", "day", "volume_num"]].copy()
-                cov_view["task_id"] = cov_view["task_id"].fillna("").astype(str)
-                cov_view["day"] = cov_view["day"].fillna("").astype(str)
-                cov_view["volume"] = cov_view["volume_num"].fillna(0).astype(int)
-                cov_view = cov_view.drop(columns=["volume_num"])
+                df_cov = df[df["task_type_norm"] == "coverage"].copy()
+                if df_cov.empty:
+                    st.info("No coverage entries for this week.")
+                else:
+                    cov_view = df_cov[["task_id", "day", "volume"]].copy()
+                    # Keep stable day ordering
+                    cov_view["day_sort"] = cov_view["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
+                    cov_view = cov_view.sort_values(["task_id", "day_sort"]).drop(columns=["day_sort"])
+                    st.dataframe(cov_view, use_container_width=True, hide_index=True)
 
-                cov_view = ensure_day_sort(cov_view, "day")
-                st.dataframe(cov_view, use_container_width=True, hide_index=True)
-
-            # =========================================================
-            # 4) Raw data -> rename to Production (Primary) + Day filter
-            #    Only Production + Primary
-            # =========================================================
+            # -------------------------
+            # 4) Production (Primary) + day filter
+            # -------------------------
             st.markdown("### Production (Primary)")
 
-            df_primary = df_prod[df_prod["role_type"].str.lower() == "primary"].copy()
-
-            # Day filter
-            day_options = ["All"] + [d for d in DAY_ORDER if d in set(df_primary["day"].astype(str))]
-            sel_day_primary = st.selectbox("Filter by day (Primary)", day_options, index=0)
-
-            if sel_day_primary != "All":
-                df_primary = df_primary[df_primary["day"].astype(str) == sel_day_primary].copy()
-
-            if df_primary.empty:
-                st.info("No primary production tasks found for this selection.")
+            if df.empty:
+                st.info("No production (primary) entries for this week.")
             else:
-                raw = df_primary[["task_id", "duration_seconds", "volume_num", "day"]].copy()
+                df_primary = df[(df["task_type_norm"] == "production") & (df["role_type_norm"] == "primary")].copy()
 
-                # Duration to hh:mm:ss
-                raw["duration (hh:mm:ss)"] = raw["duration_seconds"].apply(
-                    lambda s: f"{int(s//3600):02d}:{int((s%3600)//60):02d}:{int(s%60):02d}"
-                )
-                raw["volume"] = raw["volume_num"].fillna(0).astype(int)
+                if df_primary.empty:
+                    st.info("No production (primary) entries for this week.")
+                else:
+                    # Day filter (simple + clean)
+                    days_present = [d for d in DAY_ORDER if d in set(df_primary["day"].astype(str))]
+                    day_choice = st.selectbox("Filter by Day (optional)", ["All"] + days_present, index=0)
 
-                raw = raw.drop(columns=["duration_seconds", "volume_num"])
-                raw["day"] = raw["day"].astype(str)
+                    view = df_primary[["task_id", "duration_hhmmss", "volume", "day"]].copy()
+                    if day_choice != "All":
+                        view = view[view["day"] == day_choice].copy()
 
-                raw = ensure_day_sort(raw, "day")
-                st.dataframe(raw, use_container_width=True, hide_index=True)
+                    view["day_sort"] = view["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
+                    view = view.sort_values(["day_sort", "task_id"]).drop(columns=["day_sort"])
+                    view = view.rename(columns={"duration_hhmmss": "duration (hh:mm:ss)"})
 
-            # =========================================================
-            # 5) Production (Backup) section (always show)
-            #    Only Production + Backup
-            # =========================================================
+                    st.dataframe(view, use_container_width=True, hide_index=True)
+
+            # -------------------------
+            # 5) Production (Backup)
+            # -------------------------
             st.markdown("### Production (Backup)")
 
-            df_backup = df_prod[df_prod["role_type"].str.lower() == "backup"].copy()
-
-            # Optional day filter (same behavior)
-            day_options_b = ["All"] + [d for d in DAY_ORDER if d in set(df_backup["day"].astype(str))]
-            sel_day_backup = st.selectbox("Filter by day (Backup)", day_options_b, index=0)
-
-            if sel_day_backup != "All":
-                df_backup = df_backup[df_backup["day"].astype(str) == sel_day_backup].copy()
-
-            if df_backup.empty:
-                st.info("No backup tasks this week.")
+            if df.empty:
+                st.info("No production (backup) entries for this week.")
             else:
-                raw_b = df_backup[["task_id", "duration_seconds", "volume_num", "day"]].copy()
+                df_backup = df[(df["task_type_norm"] == "production") & (df["role_type_norm"] == "backup")].copy()
 
-                raw_b["duration (hh:mm:ss)"] = raw_b["duration_seconds"].apply(
-                    lambda s: f"{int(s//3600):02d}:{int((s%3600)//60):02d}:{int(s%60):02d}"
-                )
-                raw_b["volume"] = raw_b["volume_num"].fillna(0).astype(int)
+                if df_backup.empty:
+                    st.info("No backup tasks this week.")
+                else:
+                    days_present_b = [d for d in DAY_ORDER if d in set(df_backup["day"].astype(str))]
+                    day_choice_b = st.selectbox("Filter Backup by Day (optional)", ["All"] + days_present_b, index=0, key="backup_day_filter")
 
-                raw_b = raw_b.drop(columns=["duration_seconds", "volume_num"])
-                raw_b["day"] = raw_b["day"].astype(str)
+                    view_b = df_backup[["task_id", "duration_hhmmss", "volume", "day"]].copy()
+                    if day_choice_b != "All":
+                        view_b = view_b[view_b["day"] == day_choice_b].copy()
 
-                raw_b = ensure_day_sort(raw_b, "day")
-                st.dataframe(raw_b, use_container_width=True, hide_index=True)
+                    view_b["day_sort"] = view_b["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
+                    view_b = view_b.sort_values(["day_sort", "task_id"]).drop(columns=["day_sort"])
+                    view_b = view_b.rename(columns={"duration_hhmmss": "duration (hh:mm:ss)"})
 
-            # =========================================================
-            # 6) Projects (Weekly) (unchanged layout)
-            # =========================================================
+                    st.dataframe(view_b, use_container_width=True, hide_index=True)
+
+            # -------------------------
+            # 6) Projects (Weekly) unchanged layout
+            # -------------------------
             st.markdown("### Projects (Weekly)")
-            dfp = fetch_week_projects(sel_member, sel_week)
+
             if dfp.empty:
                 st.info("No projects found for this owner/week.")
             else:
@@ -449,104 +636,71 @@ with tabs[0]:
                 dfp_view = dfp[proj_cols].copy()
                 st.dataframe(dfp_view, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# MONTHLY TAB (placeholder - keep layout)
-# -----------------------------
+# =============================
+# Monthly Tab (layout placeholder preserved)
+# =============================
 with tabs[1]:
     st.subheader("Monthly View")
-    st.info("Next: month-to-month comparisons (hours, volume, top tasks, coverage volume, projects by status).")
+    st.info("Next: month-to-month comparisons for selected team member (hours, volume, top tasks, coverage volume, projects by status).")
 
-# -----------------------------
-# QUARTERLY TAB (placeholder - keep layout)
-# -----------------------------
+# =============================
+# Quarterly Tab (layout placeholder preserved)
+# =============================
 with tabs[2]:
     st.subheader("Quarterly View")
-    st.info("Next: quarter-to-quarter comparisons (same metrics).")
+    st.info("Next: quarter-to-quarter comparisons for selected team member (same metrics).")
 
-# -----------------------------
-# ADMIN UPLOAD TAB
-# -----------------------------
+# =============================
+# Admin Upload Tab
+# =============================
 with tabs[3]:
     st.subheader("Admin Upload (Weekly Combined Workbook)")
-    st.write("Upload the combined weekly workbook. This will overwrite that week in the DB (safe re-upload).")
+    st.caption("Upload the combined weekly workbook. This will overwrite that week in the DB (safe re-upload).")
 
-    uploaded = st.file_uploader("Upload Combined_TaskTracker_YYYY-MM-DD.xlsx", type=["xlsx"])
-
+    uploaded = st.file_uploader(
+        "Upload Combined_TaskTracker_YYYY-MM-DD.xlsx",
+        type=["xlsx"],
+        accept_multiple_files=False,
+    )
     overwrite = st.checkbox("Overwrite week if it already exists", value=True)
 
     if uploaded is not None:
         try:
-            xls = pd.ExcelFile(uploaded)
+            data = BytesIO(uploaded.read())
+            xls = pd.ExcelFile(data)
+
             if "Tasks" not in xls.sheet_names or "Projects" not in xls.sheet_names:
-                st.error("Workbook must contain sheets named 'Tasks' and 'Projects'.")
-            else:
-                df_tasks_raw = pd.read_excel(xls, "Tasks")
-                df_projects_raw = pd.read_excel(xls, "Projects")
+                st.error("Workbook must contain two sheets named exactly: 'Tasks' and 'Projects'.")
+                st.stop()
 
-                df_tasks = normalize_tasks_df(df_tasks_raw)
-                df_projects = normalize_projects_df(df_projects_raw)
+            tasks_raw = pd.read_excel(xls, sheet_name="Tasks")
+            projects_raw = pd.read_excel(xls, sheet_name="Projects")
 
-                # Determine week_ending from the file content
-                week_vals = sorted(set(df_tasks["week_ending"].dropna().astype(str)))
-                week_ending = week_vals[0] if week_vals else ""
+            tasks_df = normalize_tasks_df(tasks_raw)
+            projects_df = normalize_projects_df(projects_raw)
 
-                if not week_ending:
-                    st.error("Could not detect Week Ending from Tasks sheet. Make sure 'Week Ending' column is populated.")
-                else:
-                    with ENGINE.begin() as conn:
-                        if overwrite:
-                            conn.execute(text("DELETE FROM tasks WHERE week_ending = :w"), {"w": week_ending})
-                            conn.execute(text("DELETE FROM projects WHERE week_ending = :w"), {"w": week_ending})
+            # Determine week_ending (expect present in file)
+            week_vals = sorted(set([w for w in tasks_df["week_ending"].unique() if str(w).strip() != ""]))
+            if not week_vals:
+                st.error("Could not find 'Week Ending' values in Tasks sheet.")
+                st.stop()
 
-                        # Insert tasks
-                        now_txt = datetime.now().isoformat(timespec="seconds")
-                        for _, r in df_tasks.iterrows():
-                            conn.execute(text("""
-                                INSERT INTO tasks (
-                                    task_id, team_member, task_description, task_type, role_type,
-                                    duration_seconds, volume_text, volume_num, day, week_ending, uploaded_at
-                                ) VALUES (
-                                    :task_id, :team_member, :task_description, :task_type, :role_type,
-                                    :duration_seconds, :volume_text, :volume_num, :day, :week_ending, :uploaded_at
-                                )
-                            """), {
-                                "task_id": r["task_id"],
-                                "team_member": r["team_member"],
-                                "task_description": r["task_description"],
-                                "task_type": r["task_type"],
-                                "role_type": r["role_type"],
-                                "duration_seconds": int(r["duration_seconds"]),
-                                "volume_text": r["volume_text"],
-                                "volume_num": None if pd.isna(r["volume_num"]) else float(r["volume_num"]),
-                                "day": r["day"],
-                                "week_ending": r["week_ending"],
-                                "uploaded_at": now_txt,
-                            })
+            # If multiple, take the most common / first (your files should be single-week)
+            week_ending = week_vals[0]
 
-                        # Insert projects
-                        for _, r in df_projects.iterrows():
-                            conn.execute(text("""
-                                INSERT INTO projects (
-                                    project_name, owner, start_date, end_date, status,
-                                    days_active, notes, week_ending, uploaded_at
-                                ) VALUES (
-                                    :project_name, :owner, :start_date, :end_date, :status,
-                                    :days_active, :notes, :week_ending, :uploaded_at
-                                )
-                            """), {
-                                "project_name": r["project_name"],
-                                "owner": r["owner"],
-                                "start_date": r["start_date"],
-                                "end_date": r["end_date"],
-                                "status": r["status"],
-                                "days_active": int(r["days_active"]),
-                                "notes": r["notes"],
-                                "week_ending": r["week_ending"],
-                                "uploaded_at": now_txt,
-                            })
+            st.write(f"Detected week ending: **{week_ending}**")
+            st.write("Preview (Tasks):")
+            st.dataframe(tasks_df.head(10), use_container_width=True, hide_index=True)
+            st.write("Preview (Projects):")
+            st.dataframe(projects_df.head(10), use_container_width=True, hide_index=True)
 
-                    st.success(f"Upload complete. Week Ending = {week_ending}.")
-                    st.info("Go back to Weekly tab and refresh the page to see the updates.")
+            if st.button("Upload to Database"):
+                if overwrite:
+                    delete_week_data(week_ending)
 
+                insert_tasks(tasks_df)
+                insert_projects(projects_df)
+
+                st.success("Upload complete. You can switch to Weekly tab and verify.")
         except Exception as e:
             st.error(f"Upload failed: {e}")
