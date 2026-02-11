@@ -4,11 +4,12 @@
 # - Volume is NUMERIC ONLY (INTEGER everywhere). Any non-numeric volume becomes 0 on upload.
 # - Weekly adds: Task Summary rename, Coverage day column, Production (Primary) rename + day filter,
 #   and Production (Backup) section.
+# - Monthly + Quarterly: totals + comparisons (month-over-month / quarter-over-quarter) without changing upload logic.
 
 import os
 import re
 from io import BytesIO
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 import streamlit as st
@@ -34,7 +35,6 @@ if not DATABASE_URL:
     st.stop()
 
 ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
-
 IS_SQLITE = ENGINE.dialect.name == "sqlite"
 
 
@@ -91,9 +91,54 @@ def seconds_to_hhmmss(seconds: int) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
+def seconds_to_hours(seconds: int) -> float:
+    try:
+        return float(int(seconds)) / 3600.0
+    except Exception:
+        return 0.0
+
+
+def fmt_hours(x: float) -> str:
+    try:
+        return f"{float(x):,.2f}"
+    except Exception:
+        return "0.00"
+
+
+def fmt_int(x: int) -> str:
+    try:
+        return f"{int(x):,d}"
+    except Exception:
+        return "0"
+
+
+def safe_pct_change(curr: float, prev: float) -> float:
+    if prev is None:
+        return 0.0
+    try:
+        prev = float(prev)
+        curr = float(curr)
+    except Exception:
+        return 0.0
+    if prev == 0:
+        return 0.0 if curr == 0 else 1.0
+    return (curr - prev) / abs(prev)
+
+
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
+def parse_week_ending(series: pd.Series) -> pd.Series:
+    """
+    week_ending in DB is stored as TEXT like '2026-02-06'.
+    Parse it at query-time (do NOT change upload behavior).
+    """
+    return pd.to_datetime(series.astype(str).str.strip(), format="%Y-%m-%d", errors="coerce")
+
+
+# -----------------------------
+# Normalization (upload stays the same)
+# -----------------------------
 def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Expected from combined Tasks sheet (your screenshot):
@@ -146,7 +191,6 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
         out["duration_seconds"] = out["duration_raw"].apply(duration_to_seconds)
 
     if "duration_seconds" not in out.columns:
-        # Try minutes/hours
         sec = 0
         if "duration_minutes" in out.columns:
             sec = pd.to_numeric(out["duration_minutes"], errors="coerce").fillna(0) * 60
@@ -180,7 +224,6 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
         if c not in out.columns:
             out[c] = "" if c in ["task_id", "team_member", "task_description", "task_type", "role_type", "day", "week_ending"] else 0
 
-    # Duration seconds numeric int
     out["duration_seconds"] = pd.to_numeric(out["duration_seconds"], errors="coerce").fillna(0).astype(int)
 
     # Drop blanks
@@ -230,13 +273,11 @@ def normalize_projects_df(df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns:
             out[c] = out[c].apply(lambda x: "" if pd.isna(x) else str(x))
 
-    # Days active
     if "days_active" in out.columns:
         out["days_active"] = pd.to_numeric(out["days_active"], errors="coerce").fillna(0).astype(int)
     else:
         out["days_active"] = 0
 
-    # Drop blanks
     out = out.dropna(subset=["project_name"]).copy()
     out = out[out["project_name"].astype(str).str.strip() != ""].copy()
 
@@ -285,7 +326,6 @@ def init_db():
                 )
             )
         else:
-            # Postgres
             conn.execute(
                 text(
                     """
@@ -321,8 +361,6 @@ def init_db():
                     """
                 )
             )
-
-            # Optional indexes
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_member_week ON tasks(team_member, week_ending)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_projects_owner_week ON projects(owner, week_ending)"))
 
@@ -417,8 +455,58 @@ def fetch_week_projects(owner: str, week_ending: str) -> pd.DataFrame:
     )
 
 
+def fetch_all_tasks(member: str) -> pd.DataFrame:
+    with ENGINE.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT task_id, team_member, task_description, task_type, role_type,
+                       duration_seconds, volume, day, week_ending
+                FROM tasks
+                WHERE team_member = :m
+                """
+            ),
+            {"m": member},
+        ).fetchall()
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "task_id",
+            "team_member",
+            "task_description",
+            "task_type",
+            "role_type",
+            "duration_seconds",
+            "volume",
+            "day",
+            "week_ending",
+        ],
+    )
+    return df
+
+
+def fetch_all_projects(owner: str) -> pd.DataFrame:
+    with ENGINE.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT project_name, owner, start_date, end_date, status, days_active, notes, week_ending
+                FROM projects
+                WHERE owner = :o
+                """
+            ),
+            {"o": owner},
+        ).fetchall()
+
+    return pd.DataFrame(
+        rows,
+        columns=["project_name", "owner", "start_date", "end_date", "status", "days_active", "notes", "week_ending"],
+    )
+
+
 # -----------------------------
-# Upload / overwrite helpers
+# Upload / overwrite helpers (unchanged behavior)
 # -----------------------------
 def delete_week_data(week_ending: str):
     with ENGINE.begin() as conn:
@@ -500,6 +588,121 @@ def insert_projects(df: pd.DataFrame):
 
 
 # -----------------------------
+# Metrics builders (Monthly / Quarterly)
+# -----------------------------
+def prep_tasks_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["task_type_norm"] = out["task_type"].astype(str).str.strip().str.lower()
+    out["role_type_norm"] = out["role_type"].astype(str).str.strip().str.lower()
+    out["day"] = out["day"].astype(str).str.strip()
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0).astype(int)
+    out["duration_seconds"] = pd.to_numeric(out["duration_seconds"], errors="coerce").fillna(0).astype(int)
+
+    out["week_date"] = parse_week_ending(out["week_ending"])
+    out = out[~out["week_date"].isna()].copy()
+
+    out["month"] = out["week_date"].dt.to_period("M").astype(str)      # e.g. "2026-02"
+    out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)    # e.g. "2026Q1"
+    return out
+
+
+def prep_projects_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["week_date"] = parse_week_ending(out["week_ending"])
+    out = out[~out["week_date"].isna()].copy()
+    out["month"] = out["week_date"].dt.to_period("M").astype(str)
+    out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)
+    out["status_norm"] = out["status"].astype(str).str.strip()
+    out["project_name"] = out["project_name"].astype(str).str.strip()
+    return out
+
+
+def compute_period_metrics(tasks_df: pd.DataFrame, proj_df: pd.DataFrame) -> dict:
+    """
+    Returns a stable metric dictionary for a single period slice.
+    (Uses the same underlying logic as Weekly filters: task_type + role_type.)
+    """
+    if tasks_df is None or tasks_df.empty:
+        tasks_df = pd.DataFrame(columns=["task_type_norm", "role_type_norm", "duration_seconds", "volume", "task_id", "task_description"])
+
+    prod_primary = tasks_df[(tasks_df["task_type_norm"] == "production") & (tasks_df["role_type_norm"] == "primary")].copy()
+    prod_backup = tasks_df[(tasks_df["task_type_norm"] == "production") & (tasks_df["role_type_norm"] == "backup")].copy()
+    coverage = tasks_df[(tasks_df["task_type_norm"] == "coverage")].copy()
+    production_all = tasks_df[(tasks_df["task_type_norm"] == "production")].copy()
+
+    # Hours
+    prod_primary_hours = prod_primary["duration_seconds"].sum() / 3600.0
+    prod_backup_hours = prod_backup["duration_seconds"].sum() / 3600.0
+    prod_total_hours = production_all["duration_seconds"].sum() / 3600.0
+
+    # Volumes
+    coverage_volume = int(coverage["volume"].sum()) if not coverage.empty else 0
+    production_volume = int(production_all["volume"].sum()) if not production_all.empty else 0
+
+    # Counts
+    unique_production_tasks = int(production_all["task_id"].nunique()) if not production_all.empty else 0
+    production_entries = int(len(production_all)) if not production_all.empty else 0
+    coverage_entries = int(len(coverage)) if not coverage.empty else 0
+
+    # Top tasks by total duration (production only)
+    top_tasks = pd.DataFrame(columns=["task_id", "hours", "task_description"])
+    if not production_all.empty:
+        tmp = production_all.copy()
+        tmp["hours"] = tmp["duration_seconds"].apply(seconds_to_hours)
+        top = (
+            tmp.groupby(["task_id", "task_description"], as_index=False)["hours"]
+            .sum()
+            .sort_values(["hours", "task_id"], ascending=[False, True])
+            .head(10)
+        )
+        top_tasks = top[["task_id", "hours", "task_description"]].copy()
+        top_tasks["hours"] = top_tasks["hours"].round(2)
+
+    # Projects by status
+    proj_status = pd.DataFrame(columns=["status", "count"])
+    if proj_df is not None and not proj_df.empty:
+        proj_status = (
+            proj_df.groupby("status_norm", as_index=False)["project_name"]
+            .count()
+            .rename(columns={"status_norm": "status", "project_name": "count"})
+            .sort_values(["count", "status"], ascending=[False, True])
+        )
+
+    return {
+        "prod_primary_hours": prod_primary_hours,
+        "prod_backup_hours": prod_backup_hours,
+        "prod_total_hours": prod_total_hours,
+        "coverage_volume": coverage_volume,
+        "production_volume": production_volume,
+        "unique_production_tasks": unique_production_tasks,
+        "production_entries": production_entries,
+        "coverage_entries": coverage_entries,
+        "top_tasks": top_tasks,
+        "proj_status": proj_status,
+    }
+
+
+def period_delta_str(curr: float, prev: float, is_int: bool = False) -> str:
+    if prev is None:
+        return ""
+    if is_int:
+        try:
+            return f"{int(curr) - int(prev):+d}"
+        except Exception:
+            return ""
+    try:
+        return f"{float(curr) - float(prev):+,.2f}"
+    except Exception:
+        return ""
+
+
+# -----------------------------
 # UI: Tabs (do not change order/labels)
 # -----------------------------
 tabs = st.tabs(["Weekly", "Monthly", "Quarterly", "Admin Upload"])
@@ -550,7 +753,6 @@ with tabs[0]:
                         .drop_duplicates()
                         .sort_values(["task_id"])
                     )
-                    # Leave description blank if missing (already blank strings in your data)
                     st.dataframe(summary, use_container_width=True, hide_index=True)
 
             # -------------------------
@@ -566,7 +768,6 @@ with tabs[0]:
                     st.info("No coverage entries for this week.")
                 else:
                     cov_view = df_cov[["task_id", "day", "volume"]].copy()
-                    # Keep stable day ordering
                     cov_view["day_sort"] = cov_view["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
                     cov_view = cov_view.sort_values(["task_id", "day_sort"]).drop(columns=["day_sort"])
                     st.dataframe(cov_view, use_container_width=True, hide_index=True)
@@ -584,7 +785,6 @@ with tabs[0]:
                 if df_primary.empty:
                     st.info("No production (primary) entries for this week.")
                 else:
-                    # Day filter (simple + clean)
                     days_present = [d for d in DAY_ORDER if d in set(df_primary["day"].astype(str))]
                     day_choice = st.selectbox("Filter by Day (optional)", ["All"] + days_present, index=0)
 
@@ -637,18 +837,187 @@ with tabs[0]:
                 st.dataframe(dfp_view, use_container_width=True, hide_index=True)
 
 # =============================
-# Monthly Tab (layout placeholder preserved)
+# Monthly Tab (Totals + comparisons)
 # =============================
 with tabs[1]:
     st.subheader("Monthly View")
-    st.info("Next: month-to-month comparisons for selected team member (hours, volume, top tasks, coverage volume, projects by status).")
+
+    members = list_team_members()
+    if not members:
+        st.info("No data yet. Please upload a combined workbook in Admin Upload.")
+    else:
+        sel_member_m = st.selectbox("Team Member", members, index=0, key="monthly_member")
+
+        all_tasks = prep_tasks_for_rollups(fetch_all_tasks(sel_member_m))
+        all_projects = prep_projects_for_rollups(fetch_all_projects(sel_member_m))
+
+        if all_tasks.empty:
+            st.info("No data yet for this team member.")
+        else:
+            months = sorted(all_tasks["month"].unique().tolist())
+            if not months:
+                st.info("No month values recognized yet.")
+            else:
+                sel_month = st.selectbox("Month", months, index=len(months) - 1, key="monthly_month")
+
+                # current period slice
+                cur_tasks = all_tasks[all_tasks["month"] == sel_month].copy()
+                cur_proj = all_projects[all_projects["month"] == sel_month].copy() if not all_projects.empty else pd.DataFrame()
+
+                # previous month slice (for comparisons)
+                prev_month = None
+                try:
+                    # months are "YYYY-MM" strings; convert to Period to find prev
+                    cur_period = pd.Period(sel_month, freq="M")
+                    prev_month = str(cur_period - 1)
+                except Exception:
+                    prev_month = None
+
+                prev_tasks = all_tasks[all_tasks["month"] == prev_month].copy() if prev_month in months else pd.DataFrame()
+                prev_proj = all_projects[all_projects["month"] == prev_month].copy() if (prev_month and (not all_projects.empty) and (prev_month in all_projects["month"].unique())) else pd.DataFrame()
+
+                cur = compute_period_metrics(cur_tasks, cur_proj)
+                prev = compute_period_metrics(prev_tasks, prev_proj) if (prev_month and not prev_tasks.empty) else None
+
+                st.markdown("### Monthly Totals & Comparisons")
+                c1, c2, c3, c4 = st.columns(4)
+
+                # Production Primary Hours
+                with c1:
+                    delta = period_delta_str(cur["prod_primary_hours"], prev["prod_primary_hours"]) if prev else ""
+                    st.metric("Production (Primary) Hours", fmt_hours(cur["prod_primary_hours"]), delta)
+
+                # Production Backup Hours
+                with c2:
+                    delta = period_delta_str(cur["prod_backup_hours"], prev["prod_backup_hours"]) if prev else ""
+                    st.metric("Production (Backup) Hours", fmt_hours(cur["prod_backup_hours"]), delta)
+
+                # Coverage Volume
+                with c3:
+                    delta = period_delta_str(cur["coverage_volume"], prev["coverage_volume"], is_int=True) if prev else ""
+                    st.metric("Coverage Volume", fmt_int(cur["coverage_volume"]), delta)
+
+                # Total Production Volume
+                with c4:
+                    delta = period_delta_str(cur["production_volume"], prev["production_volume"], is_int=True) if prev else ""
+                    st.metric("Production Volume (Total)", fmt_int(cur["production_volume"]), delta)
+
+                c5, c6, c7, c8 = st.columns(4)
+                with c5:
+                    delta = period_delta_str(cur["prod_total_hours"], prev["prod_total_hours"]) if prev else ""
+                    st.metric("Production Hours (Total)", fmt_hours(cur["prod_total_hours"]), delta)
+                with c6:
+                    delta = period_delta_str(cur["unique_production_tasks"], prev["unique_production_tasks"], is_int=True) if prev else ""
+                    st.metric("Unique Production Tasks", fmt_int(cur["unique_production_tasks"]), delta)
+                with c7:
+                    delta = period_delta_str(cur["production_entries"], prev["production_entries"], is_int=True) if prev else ""
+                    st.metric("Production Entries", fmt_int(cur["production_entries"]), delta)
+                with c8:
+                    delta = period_delta_str(cur["coverage_entries"], prev["coverage_entries"], is_int=True) if prev else ""
+                    st.metric("Coverage Entries", fmt_int(cur["coverage_entries"]), delta)
+
+                st.markdown("### Top Production Tasks (by Hours)")
+                if cur["top_tasks"].empty:
+                    st.info("No production tasks found for this month.")
+                else:
+                    st.dataframe(cur["top_tasks"], use_container_width=True, hide_index=True)
+
+                st.markdown("### Projects by Status (This Month)")
+                if cur["proj_status"].empty:
+                    st.info("No projects found for this month.")
+                else:
+                    st.dataframe(cur["proj_status"], use_container_width=True, hide_index=True)
+
+                if prev_month and prev is None:
+                    st.caption(f"Note: No prior month data found for comparisons ({prev_month}).")
 
 # =============================
-# Quarterly Tab (layout placeholder preserved)
+# Quarterly Tab (Totals + comparisons)
 # =============================
 with tabs[2]:
     st.subheader("Quarterly View")
-    st.info("Next: quarter-to-quarter comparisons for selected team member (same metrics).")
+
+    members = list_team_members()
+    if not members:
+        st.info("No data yet. Please upload a combined workbook in Admin Upload.")
+    else:
+        sel_member_q = st.selectbox("Team Member", members, index=0, key="quarterly_member")
+
+        all_tasks = prep_tasks_for_rollups(fetch_all_tasks(sel_member_q))
+        all_projects = prep_projects_for_rollups(fetch_all_projects(sel_member_q))
+
+        if all_tasks.empty:
+            st.info("No data yet for this team member.")
+        else:
+            quarters = sorted(all_tasks["quarter"].unique().tolist())
+            if not quarters:
+                st.info("No quarter values recognized yet.")
+            else:
+                sel_quarter = st.selectbox("Quarter", quarters, index=len(quarters) - 1, key="quarterly_quarter")
+
+                cur_tasks = all_tasks[all_tasks["quarter"] == sel_quarter].copy()
+                cur_proj = all_projects[all_projects["quarter"] == sel_quarter].copy() if not all_projects.empty else pd.DataFrame()
+
+                prev_quarter = None
+                try:
+                    cur_period = pd.Period(sel_quarter, freq="Q")
+                    prev_quarter = str(cur_period - 1)
+                except Exception:
+                    prev_quarter = None
+
+                prev_tasks = all_tasks[all_tasks["quarter"] == prev_quarter].copy() if prev_quarter in quarters else pd.DataFrame()
+                prev_proj = all_projects[all_projects["quarter"] == prev_quarter].copy() if (prev_quarter and (not all_projects.empty) and (prev_quarter in all_projects["quarter"].unique())) else pd.DataFrame()
+
+                cur = compute_period_metrics(cur_tasks, cur_proj)
+                prev = compute_period_metrics(prev_tasks, prev_proj) if (prev_quarter and not prev_tasks.empty) else None
+
+                st.markdown("### Quarterly Totals & Comparisons")
+                c1, c2, c3, c4 = st.columns(4)
+
+                with c1:
+                    delta = period_delta_str(cur["prod_primary_hours"], prev["prod_primary_hours"]) if prev else ""
+                    st.metric("Production (Primary) Hours", fmt_hours(cur["prod_primary_hours"]), delta)
+
+                with c2:
+                    delta = period_delta_str(cur["prod_backup_hours"], prev["prod_backup_hours"]) if prev else ""
+                    st.metric("Production (Backup) Hours", fmt_hours(cur["prod_backup_hours"]), delta)
+
+                with c3:
+                    delta = period_delta_str(cur["coverage_volume"], prev["coverage_volume"], is_int=True) if prev else ""
+                    st.metric("Coverage Volume", fmt_int(cur["coverage_volume"]), delta)
+
+                with c4:
+                    delta = period_delta_str(cur["production_volume"], prev["production_volume"], is_int=True) if prev else ""
+                    st.metric("Production Volume (Total)", fmt_int(cur["production_volume"]), delta)
+
+                c5, c6, c7, c8 = st.columns(4)
+                with c5:
+                    delta = period_delta_str(cur["prod_total_hours"], prev["prod_total_hours"]) if prev else ""
+                    st.metric("Production Hours (Total)", fmt_hours(cur["prod_total_hours"]), delta)
+                with c6:
+                    delta = period_delta_str(cur["unique_production_tasks"], prev["unique_production_tasks"], is_int=True) if prev else ""
+                    st.metric("Unique Production Tasks", fmt_int(cur["unique_production_tasks"]), delta)
+                with c7:
+                    delta = period_delta_str(cur["production_entries"], prev["production_entries"], is_int=True) if prev else ""
+                    st.metric("Production Entries", fmt_int(cur["production_entries"]), delta)
+                with c8:
+                    delta = period_delta_str(cur["coverage_entries"], prev["coverage_entries"], is_int=True) if prev else ""
+                    st.metric("Coverage Entries", fmt_int(cur["coverage_entries"]), delta)
+
+                st.markdown("### Top Production Tasks (by Hours)")
+                if cur["top_tasks"].empty:
+                    st.info("No production tasks found for this quarter.")
+                else:
+                    st.dataframe(cur["top_tasks"], use_container_width=True, hide_index=True)
+
+                st.markdown("### Projects by Status (This Quarter)")
+                if cur["proj_status"].empty:
+                    st.info("No projects found for this quarter.")
+                else:
+                    st.dataframe(cur["proj_status"], use_container_width=True, hide_index=True)
+
+                if prev_quarter and prev is None:
+                    st.caption(f"Note: No prior quarter data found for comparisons ({prev_quarter}).")
 
 # =============================
 # Admin Upload Tab
@@ -685,7 +1054,7 @@ with tabs[3]:
                 st.error("Could not find 'Week Ending' values in Tasks sheet.")
                 st.stop()
 
-            # If multiple, take the most common / first (your files should be single-week)
+            # If multiple, take the first (your files should be single-week)
             week_ending = week_vals[0]
 
             st.write(f"Detected week ending: **{week_ending}**")
