@@ -2,9 +2,11 @@
 # MAO Workflow Tracker Dashboard (Streamlit)
 # - Weekly / Monthly / Quarterly / Admin Upload tabs (layout preserved)
 # - Volume is NUMERIC ONLY (INTEGER everywhere). Any non-numeric volume becomes 0 on upload.
-# - Weekly remains unchanged (your current working layout).
-# - Monthly + Quarterly: totals + comparisons (month-over-month / quarter-over-quarter)
-#   + Production KPI tables by Task now include deltas, split into Primary vs Backup (no descriptions).
+# - Weekly adds: Task Summary rename, Coverage day column, Production (Primary) rename + day filter,
+#   and Production (Backup) section.
+# - Monthly + Quarterly: totals + comparisons (month-over-month / quarter-over-quarter) without changing upload logic.
+# - Monthly + Quarterly tables: KPI by task for Production (Primary), Production (Backup), and Coverage
+#   with deltas vs prior period. (Descriptions removed in Monthly/Quarterly only.)
 
 import os
 import re
@@ -54,13 +56,14 @@ def duration_to_seconds(val) -> int:
     if not s:
         return 0
 
-    # numeric-ish => seconds
+    # If it's numeric-ish, treat as seconds
     try:
         if re.fullmatch(r"-?\d+(\.\d+)?", s):
             return max(0, int(float(s)))
     except Exception:
         pass
 
+    # Time format
     parts = s.split(":")
     try:
         parts = [int(float(p)) for p in parts]
@@ -119,6 +122,51 @@ def parse_week_ending(series: pd.Series) -> pd.Series:
     Parse it at query-time (do NOT change upload behavior).
     """
     return pd.to_datetime(series.astype(str).str.strip(), format="%Y-%m-%d", errors="coerce")
+
+
+def period_delta_str(curr: float, prev: float, is_int: bool = False) -> str:
+    """Delta string for st.metric."""
+    if prev is None:
+        return ""
+    if is_int:
+        try:
+            return f"{int(curr) - int(prev):+d}"
+        except Exception:
+            return ""
+    try:
+        return f"{float(curr) - float(prev):+,.2f}"
+    except Exception:
+        return ""
+
+
+def style_delta_df(df: pd.DataFrame, delta_cols: List[str]) -> pd.io.formats.style.Styler if False else object:
+    """
+    Return a Styler with red/green formatting for delta columns.
+    IMPORTANT: No runtime pandas Styler type annotations (prevents Render crash).
+    """
+    if df is None or df.empty:
+        return df
+
+    def color(v):
+        try:
+            v = float(v)
+        except Exception:
+            return ""
+        if v > 0:
+            return "color: green;"
+        if v < 0:
+            return "color: red;"
+        return ""
+
+    # If pandas Styler is unavailable for some reason, just return df
+    try:
+        sty = df.style
+        for c in delta_cols:
+            if c in df.columns:
+                sty = sty.applymap(color, subset=[c])
+        return sty
+    except Exception:
+        return df
 
 
 # -----------------------------
@@ -349,7 +397,6 @@ def init_db():
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_member_week ON tasks(team_member, week_ending)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_projects_owner_week ON projects(owner, week_ending)"))
 
-
 init_db()
 
 # -----------------------------
@@ -571,7 +618,7 @@ def insert_projects(df: pd.DataFrame):
 
 
 # -----------------------------
-# Rollup prep
+# Metrics builders (Monthly / Quarterly)
 # -----------------------------
 def prep_tasks_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -588,7 +635,7 @@ def prep_tasks_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
     out = out[~out["week_date"].isna()].copy()
 
     out["month"] = out["week_date"].dt.to_period("M").astype(str)      # "YYYY-MM"
-    out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)    # "YYYYQn"
+    out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)    # "YYYYQ#"
     return out
 
 
@@ -607,10 +654,7 @@ def prep_projects_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_period_metrics(tasks_df: pd.DataFrame, proj_df: pd.DataFrame) -> dict:
-    """
-    Stable metric dictionary for a single period slice.
-    Uses same underlying logic as Weekly filters: task_type + role_type.
-    """
+    """Stable totals for the period (used by Monthly/Quarterly top metrics)."""
     if tasks_df is None or tasks_df.empty:
         tasks_df = pd.DataFrame(columns=["task_type_norm", "role_type_norm", "duration_seconds", "volume", "task_id"])
 
@@ -621,23 +665,8 @@ def compute_period_metrics(tasks_df: pd.DataFrame, proj_df: pd.DataFrame) -> dic
 
     prod_primary_hours = prod_primary["duration_seconds"].sum() / 3600.0
     prod_backup_hours = prod_backup["duration_seconds"].sum() / 3600.0
-    prod_total_hours = production_all["duration_seconds"].sum() / 3600.0
-
     coverage_volume = int(coverage["volume"].sum()) if not coverage.empty else 0
     production_volume = int(production_all["volume"].sum()) if not production_all.empty else 0
-
-    top_tasks = pd.DataFrame(columns=["task_id", "hours"])
-    if not production_all.empty:
-        tmp = production_all.copy()
-        tmp["hours"] = tmp["duration_seconds"].apply(seconds_to_hours)
-        top = (
-            tmp.groupby(["task_id"], as_index=False)["hours"]
-            .sum()
-            .sort_values(["hours", "task_id"], ascending=[False, True])
-            .head(15)
-        )
-        top_tasks = top[["task_id", "hours"]].copy()
-        top_tasks["hours"] = top_tasks["hours"].round(2)
 
     proj_status = pd.DataFrame(columns=["status", "count"])
     if proj_df is not None and not proj_df.empty:
@@ -651,85 +680,81 @@ def compute_period_metrics(tasks_df: pd.DataFrame, proj_df: pd.DataFrame) -> dic
     return {
         "prod_primary_hours": prod_primary_hours,
         "prod_backup_hours": prod_backup_hours,
-        "prod_total_hours": prod_total_hours,
         "coverage_volume": coverage_volume,
         "production_volume": production_volume,
-        "top_tasks": top_tasks,
         "proj_status": proj_status,
     }
 
 
-def period_delta_str(curr: float, prev: float, is_int: bool = False) -> str:
-    if prev is None:
-        return ""
-    if is_int:
-        try:
-            return f"{int(curr) - int(prev):+d}"
-        except Exception:
-            return ""
-    try:
-        return f"{float(curr) - float(prev):+,.2f}"
-    except Exception:
-        return ""
-
-
-def build_task_kpi_table_with_deltas(cur_tasks: pd.DataFrame, prev_tasks: pd.DataFrame, role_type_norm: str) -> pd.DataFrame:
+def kpi_by_task(tasks_df: pd.DataFrame, filter_mask: pd.Series, kind: str) -> pd.DataFrame:
     """
-    Per-task KPI table for Production tasks for a given role_type ("primary" or "backup"),
-    including deltas vs previous period. No descriptions (per your request).
-    Columns: task_id, hours, volume, Δ hours, Δ volume
+    Build KPI table by task_id for a given mask.
+    kind:
+      - "production" => hours + volume
+      - "coverage"   => volume only
+    Returns columns:
+      production: task_id, primary_hours or backup_hours (set by caller), production_volume
+      coverage: task_id, coverage_volume
     """
-    def agg(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["task_id", "hours", "volume"])
-        x = df[(df["task_type_norm"] == "production") & (df["role_type_norm"] == role_type_norm)].copy()
-        if x.empty:
-            return pd.DataFrame(columns=["task_id", "hours", "volume"])
-        x["hours"] = x["duration_seconds"].fillna(0).astype(int) / 3600.0
-        out = x.groupby("task_id", as_index=False).agg(
-            hours=("hours", "sum"),
-            volume=("volume", "sum"),
+    if tasks_df is None or tasks_df.empty:
+        return pd.DataFrame()
+
+    df = tasks_df[filter_mask].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    if kind == "coverage":
+        out = (
+            df.groupby("task_id", as_index=False)["volume"]
+            .sum()
+            .rename(columns={"volume": "Coverage Volume"})
+            .sort_values(["Coverage Volume", "task_id"], ascending=[False, True])
         )
-        out["hours"] = pd.to_numeric(out["hours"], errors="coerce").fillna(0.0)
-        out["volume"] = pd.to_numeric(out["volume"], errors="coerce").fillna(0).astype(int)
+        out["Coverage Volume"] = out["Coverage Volume"].astype(int)
         return out
 
-    cur = agg(cur_tasks)
-    prev = agg(prev_tasks).rename(columns={"hours": "prev_hours", "volume": "prev_volume"})
+    # production
+    df["hours"] = df["duration_seconds"].apply(seconds_to_hours)
+    out = (
+        df.groupby("task_id", as_index=False)
+        .agg(hours=("hours", "sum"), volume=("volume", "sum"))
+        .sort_values(["hours", "task_id"], ascending=[False, True])
+    )
+    out["hours"] = out["hours"].round(2)
+    out["volume"] = out["volume"].astype(int)
+    out = out.rename(columns={"hours": "Hours", "volume": "Production Volume"})
+    return out
 
-    if cur.empty and prev.empty:
-        return pd.DataFrame(columns=["task_id", "hours", "volume", "Δ hours", "Δ volume"])
 
-    merged = cur.merge(prev, on="task_id", how="outer").fillna(0)
+def add_deltas(curr_df: pd.DataFrame, prev_df: pd.DataFrame, value_cols: List[str], key_col: str = "task_id") -> pd.DataFrame:
+    """
+    Merge curr + prev and add Δ columns for each value col.
+    Output keeps curr values, adds Δ columns:
+      e.g. "Hours" + "Δ Hours", "Production Volume" + "Δ Production Volume"
+    """
+    if curr_df is None or curr_df.empty:
+        return pd.DataFrame()
 
-    merged["hours"] = pd.to_numeric(merged.get("hours", 0), errors="coerce").fillna(0.0)
-    merged["volume"] = pd.to_numeric(merged.get("volume", 0), errors="coerce").fillna(0).astype(int)
-    merged["prev_hours"] = pd.to_numeric(merged.get("prev_hours", 0), errors="coerce").fillna(0.0)
-    merged["prev_volume"] = pd.to_numeric(merged.get("prev_volume", 0), errors="coerce").fillna(0).astype(int)
+    curr = curr_df.copy()
+    if prev_df is None or prev_df.empty:
+        # still include Δ columns as 0
+        for c in value_cols:
+            curr[f"Δ {c}"] = 0
+        return curr
 
-    merged["Δ hours"] = (merged["hours"] - merged["prev_hours"]).round(2)
-    merged["Δ volume"] = (merged["volume"] - merged["prev_volume"]).astype(int)
+    prev = prev_df.copy()
+    merged = curr.merge(prev[[key_col] + value_cols], on=key_col, how="left", suffixes=("", "_prev"))
+    for c in value_cols:
+        prevc = f"{c}_prev"
+        if prevc not in merged.columns:
+            merged[f"Δ {c}"] = 0
+        else:
+            merged[f"Δ {c}"] = merged[c] - merged[prevc].fillna(0)
 
-    merged["hours"] = merged["hours"].round(2)
-
-    merged = merged[["task_id", "hours", "volume", "Δ hours", "Δ volume"]].copy()
-    merged = merged.sort_values(["hours", "task_id"], ascending=[False, True]).reset_index(drop=True)
+    # Drop *_prev columns
+    drop_cols = [f"{c}_prev" for c in value_cols if f"{c}_prev" in merged.columns]
+    merged = merged.drop(columns=drop_cols)
     return merged
-
-
-def style_deltas(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    """Red/green delta styling for Δ columns."""
-    def color_neg_pos(v):
-        try:
-            v = float(v)
-        except Exception:
-            return ""
-        if v > 0:
-            return "color: green;"
-        if v < 0:
-            return "color: red;"
-        return ""
-    return df.style.applymap(color_neg_pos, subset=["Δ hours", "Δ volume"])
 
 
 # -----------------------------
@@ -758,18 +783,21 @@ with tabs[0]:
             df = fetch_week_tasks(sel_member, sel_week)
             dfp = fetch_week_projects(sel_member, sel_week)
 
+            # Standardize for comparisons
             if not df.empty:
                 df["task_type_norm"] = df["task_type"].str.strip().str.lower()
                 df["role_type_norm"] = df["role_type"].str.strip().str.lower()
                 df["day"] = df["day"].astype(str).str.strip()
                 df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(int)
 
-            # Task Summary
+            # 2) Task Summary
             st.markdown("### Task Summary")
+
             if df.empty:
                 st.info("No task entries for this week.")
             else:
                 df_prod = df[df["task_type_norm"] == "production"].copy()
+
                 if df_prod.empty:
                     st.info("No production entries for this week.")
                 else:
@@ -780,8 +808,9 @@ with tabs[0]:
                     )
                     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-            # Coverage
+            # 3) Coverage
             st.markdown("### Coverage")
+
             if df.empty:
                 st.info("No coverage entries for this week.")
             else:
@@ -794,12 +823,14 @@ with tabs[0]:
                     cov_view = cov_view.sort_values(["task_id", "day_sort"]).drop(columns=["day_sort"])
                     st.dataframe(cov_view, use_container_width=True, hide_index=True)
 
-            # Production (Primary)
+            # 4) Production (Primary)
             st.markdown("### Production (Primary)")
+
             if df.empty:
                 st.info("No production (primary) entries for this week.")
             else:
                 df_primary = df[(df["task_type_norm"] == "production") & (df["role_type_norm"] == "primary")].copy()
+
                 if df_primary.empty:
                     st.info("No production (primary) entries for this week.")
                 else:
@@ -813,14 +844,17 @@ with tabs[0]:
                     view["day_sort"] = view["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
                     view = view.sort_values(["day_sort", "task_id"]).drop(columns=["day_sort"])
                     view = view.rename(columns={"duration_hhmmss": "duration (hh:mm:ss)"})
+
                     st.dataframe(view, use_container_width=True, hide_index=True)
 
-            # Production (Backup)
+            # 5) Production (Backup)
             st.markdown("### Production (Backup)")
+
             if df.empty:
                 st.info("No production (backup) entries for this week.")
             else:
                 df_backup = df[(df["task_type_norm"] == "production") & (df["role_type_norm"] == "backup")].copy()
+
                 if df_backup.empty:
                     st.info("No backup tasks this week.")
                 else:
@@ -834,10 +868,12 @@ with tabs[0]:
                     view_b["day_sort"] = view_b["day"].apply(lambda d: DAY_ORDER.index(d) if d in DAY_ORDER else 99)
                     view_b = view_b.sort_values(["day_sort", "task_id"]).drop(columns=["day_sort"])
                     view_b = view_b.rename(columns={"duration_hhmmss": "duration (hh:mm:ss)"})
+
                     st.dataframe(view_b, use_container_width=True, hide_index=True)
 
-            # Projects (Weekly)
+            # 6) Projects (Weekly)
             st.markdown("### Projects (Weekly)")
+
             if dfp.empty:
                 st.info("No projects found for this owner/week.")
             else:
@@ -879,59 +915,90 @@ with tabs[1]:
                 except Exception:
                     prev_month = None
 
-                prev_tasks = all_tasks[all_tasks["month"] == prev_month].copy() if (prev_month and prev_month in months) else pd.DataFrame()
+                prev_tasks = all_tasks[all_tasks["month"] == prev_month].copy() if (prev_month in months) else pd.DataFrame()
                 prev_proj = all_projects[all_projects["month"] == prev_month].copy() if (prev_month and (not all_projects.empty) and (prev_month in all_projects["month"].unique())) else pd.DataFrame()
 
-                cur = compute_period_metrics(cur_tasks, cur_proj)
-                prev = compute_period_metrics(prev_tasks, prev_proj) if (prev_month and not prev_tasks.empty) else None
+                cur_tot = compute_period_metrics(cur_tasks, cur_proj)
+                prev_tot = compute_period_metrics(prev_tasks, prev_proj) if (prev_month and not prev_tasks.empty) else None
 
                 st.markdown("### Monthly Totals & Comparisons")
                 c1, c2, c3, c4 = st.columns(4)
 
                 with c1:
-                    delta = period_delta_str(cur["prod_primary_hours"], prev["prod_primary_hours"]) if prev else ""
-                    st.metric("Production (Primary) Hours", fmt_hours(cur["prod_primary_hours"]), delta)
+                    delta = period_delta_str(cur_tot["prod_primary_hours"], prev_tot["prod_primary_hours"]) if prev_tot else ""
+                    st.metric("Production (Primary) Hours", fmt_hours(cur_tot["prod_primary_hours"]), delta)
 
                 with c2:
-                    delta = period_delta_str(cur["prod_backup_hours"], prev["prod_backup_hours"]) if prev else ""
-                    st.metric("Production (Backup) Hours", fmt_hours(cur["prod_backup_hours"]), delta)
+                    delta = period_delta_str(cur_tot["prod_backup_hours"], prev_tot["prod_backup_hours"]) if prev_tot else ""
+                    st.metric("Production (Backup) Hours", fmt_hours(cur_tot["prod_backup_hours"]), delta)
 
                 with c3:
-                    delta = period_delta_str(cur["coverage_volume"], prev["coverage_volume"], is_int=True) if prev else ""
-                    st.metric("Coverage Volume", fmt_int(cur["coverage_volume"]), delta)
+                    delta = period_delta_str(cur_tot["coverage_volume"], prev_tot["coverage_volume"], is_int=True) if prev_tot else ""
+                    st.metric("Coverage Volume", fmt_int(cur_tot["coverage_volume"]), delta)
 
                 with c4:
-                    delta = period_delta_str(cur["production_volume"], prev["production_volume"], is_int=True) if prev else ""
-                    st.metric("Production Volume (Total)", fmt_int(cur["production_volume"]), delta)
+                    delta = period_delta_str(cur_tot["production_volume"], prev_tot["production_volume"], is_int=True) if prev_tot else ""
+                    st.metric("Production Volume (Total)", fmt_int(cur_tot["production_volume"]), delta)
 
-                st.markdown("### Production Tasks — KPIs by Task (Primary)")
-                tbl_p = build_task_kpi_table_with_deltas(cur_tasks, prev_tasks, "primary")
-                if tbl_p.empty:
-                    st.info("No primary production tasks found for this month.")
+                # ---------- KPI by Task: Production (Primary) ----------
+                st.markdown("### Production Tasks (Monthly) — KPIs by Task (Primary)")
+
+                mask_primary = (cur_tasks["task_type_norm"] == "production") & (cur_tasks["role_type_norm"] == "primary")
+                mask_primary_prev = (prev_tasks["task_type_norm"] == "production") & (prev_tasks["role_type_norm"] == "primary") if not prev_tasks.empty else None
+
+                cur_primary = kpi_by_task(cur_tasks, mask_primary, kind="production")
+                prev_primary = kpi_by_task(prev_tasks, mask_primary_prev, kind="production") if (mask_primary_prev is not None) else pd.DataFrame()
+
+                if cur_primary.empty:
+                    st.info("No primary production tasks for this month.")
                 else:
-                    st.dataframe(style_deltas(tbl_p), use_container_width=True, hide_index=True)
+                    # add deltas and remove descriptions (none included here anyway)
+                    cur_primary = add_deltas(cur_primary, prev_primary, value_cols=["Hours", "Production Volume"])
+                    # rename for clarity
+                    cur_primary = cur_primary.rename(columns={"Hours": "Primary Hours", "Δ Hours": "Δ Primary Hours"})
+                    # style only delta columns
+                    styled = style_delta_df(cur_primary, delta_cols=["Δ Primary Hours", "Δ Production Volume"])
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-                st.markdown("### Production Tasks — KPIs by Task (Backup)")
-                tbl_b = build_task_kpi_table_with_deltas(cur_tasks, prev_tasks, "backup")
-                if tbl_b.empty:
-                    st.info("No backup tasks this month.")
+                # ---------- KPI by Task: Production (Backup) ----------
+                st.markdown("### Production Tasks (Monthly) — KPIs by Task (Backup)")
+
+                mask_backup = (cur_tasks["task_type_norm"] == "production") & (cur_tasks["role_type_norm"] == "backup")
+                mask_backup_prev = (prev_tasks["task_type_norm"] == "production") & (prev_tasks["role_type_norm"] == "backup") if not prev_tasks.empty else None
+
+                cur_backup = kpi_by_task(cur_tasks, mask_backup, kind="production")
+                prev_backup = kpi_by_task(prev_tasks, mask_backup_prev, kind="production") if (mask_backup_prev is not None) else pd.DataFrame()
+
+                if cur_backup.empty:
+                    st.info("No backup tasks for this month.")
                 else:
-                    st.dataframe(style_deltas(tbl_b), use_container_width=True, hide_index=True)
+                    cur_backup = add_deltas(cur_backup, prev_backup, value_cols=["Hours", "Production Volume"])
+                    cur_backup = cur_backup.rename(columns={"Hours": "Backup Hours", "Δ Hours": "Δ Backup Hours"})
+                    styled_b = style_delta_df(cur_backup, delta_cols=["Δ Backup Hours", "Δ Production Volume"])
+                    st.dataframe(styled_b, use_container_width=True, hide_index=True)
 
-                st.markdown("### Top Production Tasks (by Hours)")
-                if cur["top_tasks"].empty:
-                    st.info("No production tasks found for this month.")
+                # ---------- KPI by Task: Coverage ----------
+                st.markdown("### Coverage Tasks (Monthly) — KPIs by Task")
+
+                mask_cov = (cur_tasks["task_type_norm"] == "coverage")
+                mask_cov_prev = (prev_tasks["task_type_norm"] == "coverage") if not prev_tasks.empty else None
+
+                cur_cov = kpi_by_task(cur_tasks, mask_cov, kind="coverage")
+                prev_cov = kpi_by_task(prev_tasks, mask_cov_prev, kind="coverage") if (mask_cov_prev is not None) else pd.DataFrame()
+
+                if cur_cov.empty:
+                    st.info("No coverage tasks for this month.")
                 else:
-                    st.dataframe(cur["top_tasks"], use_container_width=True, hide_index=True)
+                    cur_cov = add_deltas(cur_cov, prev_cov, value_cols=["Coverage Volume"])
+                    styled_c = style_delta_df(cur_cov, delta_cols=["Δ Coverage Volume"])
+                    st.dataframe(styled_c, use_container_width=True, hide_index=True)
 
+                # Projects by status (unchanged)
                 st.markdown("### Projects by Status (This Month)")
-                if cur["proj_status"].empty:
+                if cur_tot["proj_status"].empty:
                     st.info("No projects found for this month.")
                 else:
-                    st.dataframe(cur["proj_status"], use_container_width=True, hide_index=True)
-
-                if prev_month and prev is None:
-                    st.caption(f"Note: No prior month data found for comparisons ({prev_month}).")
+                    st.dataframe(cur_tot["proj_status"], use_container_width=True, hide_index=True)
 
 # =============================
 # Quarterly Tab
@@ -967,62 +1034,89 @@ with tabs[2]:
                 except Exception:
                     prev_quarter = None
 
-                prev_tasks = all_tasks[all_tasks["quarter"] == prev_quarter].copy() if (prev_quarter and prev_quarter in quarters) else pd.DataFrame()
+                prev_tasks = all_tasks[all_tasks["quarter"] == prev_quarter].copy() if (prev_quarter in quarters) else pd.DataFrame()
                 prev_proj = all_projects[all_projects["quarter"] == prev_quarter].copy() if (prev_quarter and (not all_projects.empty) and (prev_quarter in all_projects["quarter"].unique())) else pd.DataFrame()
 
-                cur = compute_period_metrics(cur_tasks, cur_proj)
-                prev = compute_period_metrics(prev_tasks, prev_proj) if (prev_quarter and not prev_tasks.empty) else None
+                cur_tot = compute_period_metrics(cur_tasks, cur_proj)
+                prev_tot = compute_period_metrics(prev_tasks, prev_proj) if (prev_quarter and not prev_tasks.empty) else None
 
                 st.markdown("### Quarterly Totals & Comparisons")
                 c1, c2, c3, c4 = st.columns(4)
 
                 with c1:
-                    delta = period_delta_str(cur["prod_primary_hours"], prev["prod_primary_hours"]) if prev else ""
-                    st.metric("Production (Primary) Hours", fmt_hours(cur["prod_primary_hours"]), delta)
+                    delta = period_delta_str(cur_tot["prod_primary_hours"], prev_tot["prod_primary_hours"]) if prev_tot else ""
+                    st.metric("Production (Primary) Hours", fmt_hours(cur_tot["prod_primary_hours"]), delta)
 
                 with c2:
-                    delta = period_delta_str(cur["prod_backup_hours"], prev["prod_backup_hours"]) if prev else ""
-                    st.metric("Production (Backup) Hours", fmt_hours(cur["prod_backup_hours"]), delta)
+                    delta = period_delta_str(cur_tot["prod_backup_hours"], prev_tot["prod_backup_hours"]) if prev_tot else ""
+                    st.metric("Production (Backup) Hours", fmt_hours(cur_tot["prod_backup_hours"]), delta)
 
                 with c3:
-                    delta = period_delta_str(cur["coverage_volume"], prev["coverage_volume"], is_int=True) if prev else ""
-                    st.metric("Coverage Volume", fmt_int(cur["coverage_volume"]), delta)
+                    delta = period_delta_str(cur_tot["coverage_volume"], prev_tot["coverage_volume"], is_int=True) if prev_tot else ""
+                    st.metric("Coverage Volume", fmt_int(cur_tot["coverage_volume"]), delta)
 
                 with c4:
-                    delta = period_delta_str(cur["production_volume"], prev["production_volume"], is_int=True) if prev else ""
-                    st.metric("Production Volume (Total)", fmt_int(cur["production_volume"]), delta)
+                    delta = period_delta_str(cur_tot["production_volume"], prev_tot["production_volume"], is_int=True) if prev_tot else ""
+                    st.metric("Production Volume (Total)", fmt_int(cur_tot["production_volume"]), delta)
 
-                st.markdown("### Production Tasks — KPIs by Task (Primary)")
-                tbl_p = build_task_kpi_table_with_deltas(cur_tasks, prev_tasks, "primary")
-                if tbl_p.empty:
-                    st.info("No primary production tasks found for this quarter.")
-                else:
-                    st.dataframe(style_deltas(tbl_p), use_container_width=True, hide_index=True)
+                # KPI by task — Production (Primary)
+                st.markdown("### Production Tasks (Quarterly) — KPIs by Task (Primary)")
 
-                st.markdown("### Production Tasks — KPIs by Task (Backup)")
-                tbl_b = build_task_kpi_table_with_deltas(cur_tasks, prev_tasks, "backup")
-                if tbl_b.empty:
-                    st.info("No backup tasks this quarter.")
-                else:
-                    st.dataframe(style_deltas(tbl_b), use_container_width=True, hide_index=True)
+                mask_primary = (cur_tasks["task_type_norm"] == "production") & (cur_tasks["role_type_norm"] == "primary")
+                mask_primary_prev = (prev_tasks["task_type_norm"] == "production") & (prev_tasks["role_type_norm"] == "primary") if not prev_tasks.empty else None
 
-                st.markdown("### Top Production Tasks (by Hours)")
-                if cur["top_tasks"].empty:
-                    st.info("No production tasks found for this quarter.")
+                cur_primary = kpi_by_task(cur_tasks, mask_primary, kind="production")
+                prev_primary = kpi_by_task(prev_tasks, mask_primary_prev, kind="production") if (mask_primary_prev is not None) else pd.DataFrame()
+
+                if cur_primary.empty:
+                    st.info("No primary production tasks for this quarter.")
                 else:
-                    st.dataframe(cur["top_tasks"], use_container_width=True, hide_index=True)
+                    cur_primary = add_deltas(cur_primary, prev_primary, value_cols=["Hours", "Production Volume"])
+                    cur_primary = cur_primary.rename(columns={"Hours": "Primary Hours", "Δ Hours": "Δ Primary Hours"})
+                    styled = style_delta_df(cur_primary, delta_cols=["Δ Primary Hours", "Δ Production Volume"])
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                # KPI by task — Production (Backup)
+                st.markdown("### Production Tasks (Quarterly) — KPIs by Task (Backup)")
+
+                mask_backup = (cur_tasks["task_type_norm"] == "production") & (cur_tasks["role_type_norm"] == "backup")
+                mask_backup_prev = (prev_tasks["task_type_norm"] == "production") & (prev_tasks["role_type_norm"] == "backup") if not prev_tasks.empty else None
+
+                cur_backup = kpi_by_task(cur_tasks, mask_backup, kind="production")
+                prev_backup = kpi_by_task(prev_tasks, mask_backup_prev, kind="production") if (mask_backup_prev is not None) else pd.DataFrame()
+
+                if cur_backup.empty:
+                    st.info("No backup tasks for this quarter.")
+                else:
+                    cur_backup = add_deltas(cur_backup, prev_backup, value_cols=["Hours", "Production Volume"])
+                    cur_backup = cur_backup.rename(columns={"Hours": "Backup Hours", "Δ Hours": "Δ Backup Hours"})
+                    styled_b = style_delta_df(cur_backup, delta_cols=["Δ Backup Hours", "Δ Production Volume"])
+                    st.dataframe(styled_b, use_container_width=True, hide_index=True)
+
+                # KPI by task — Coverage
+                st.markdown("### Coverage Tasks (Quarterly) — KPIs by Task")
+
+                mask_cov = (cur_tasks["task_type_norm"] == "coverage")
+                mask_cov_prev = (prev_tasks["task_type_norm"] == "coverage") if not prev_tasks.empty else None
+
+                cur_cov = kpi_by_task(cur_tasks, mask_cov, kind="coverage")
+                prev_cov = kpi_by_task(prev_tasks, mask_cov_prev, kind="coverage") if (mask_cov_prev is not None) else pd.DataFrame()
+
+                if cur_cov.empty:
+                    st.info("No coverage tasks for this quarter.")
+                else:
+                    cur_cov = add_deltas(cur_cov, prev_cov, value_cols=["Coverage Volume"])
+                    styled_c = style_delta_df(cur_cov, delta_cols=["Δ Coverage Volume"])
+                    st.dataframe(styled_c, use_container_width=True, hide_index=True)
 
                 st.markdown("### Projects by Status (This Quarter)")
-                if cur["proj_status"].empty:
+                if cur_tot["proj_status"].empty:
                     st.info("No projects found for this quarter.")
                 else:
-                    st.dataframe(cur["proj_status"], use_container_width=True, hide_index=True)
-
-                if prev_quarter and prev is None:
-                    st.caption(f"Note: No prior quarter data found for comparisons ({prev_quarter}).")
+                    st.dataframe(cur_tot["proj_status"], use_container_width=True, hide_index=True)
 
 # =============================
-# Admin Upload Tab (UNCHANGED)
+# Admin Upload Tab
 # =============================
 with tabs[3]:
     st.subheader("Admin Upload (Weekly Combined Workbook)")
