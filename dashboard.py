@@ -1,12 +1,12 @@
 # dashboard.py
 # MAO Workflow Tracker Dashboard
-# Task-only version for Jan/Feb/March clean monthly files
+# Executive-ready version
 # - MAS-style layout/colors
 # - Postgres-backed
-# - Full replace upload for multiple monthly files
-# - Weekly / Monthly / Quarterly views
+# - Weekly / Monthly Overview / Monthly / Quarterly / Admin Upload
 # - Production uses raw Duration Seconds
 # - Coverage duration is derived from remaining 8-hour day time
+# - Supports full replace, month replace, and week replace uploads
 
 import os
 from io import BytesIO
@@ -22,7 +22,7 @@ import plotly.express as px
 st.set_page_config(page_title="MAO Workflow Tracker Dashboard", layout="wide")
 
 # ---------------------------------
-# Styling (adapted from MAS dashboard)
+# Styling
 # ---------------------------------
 TEXT_COLOR = "#102033"
 SUBTEXT_COLOR = "#556476"
@@ -156,14 +156,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------------------------
-# Page title
-# ---------------------------------
 st.title("MAO Workflow Tracker Dashboard")
 st.caption("LPL Financial – Operations")
 
 # ---------------------------------
-# Helpers
+# Constants / Helpers
 # ---------------------------------
 DAY_TO_OFFSET = {
     "Monday": 4,
@@ -174,7 +171,6 @@ DAY_TO_OFFSET = {
     "Saturday": -1,
     "Sunday": -2,
 }
-
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
@@ -299,6 +295,26 @@ def apply_layout(fig, height=360, show_legend=True):
     return fig
 
 
+def period_delta_str(curr, prev, is_int=False):
+    if prev is None:
+        return ""
+    try:
+        if is_int:
+            return f"{int(curr) - int(prev):+d}"
+        return f"{float(curr) - float(prev):+,.2f}"
+    except Exception:
+        return ""
+
+
+def task_bucket(task_id: str) -> str:
+    s = _clean_str(task_id).lower()
+    if "mailbox" in s:
+        return "Mailbox"
+    if "dynamics" in s or "cases & tasks" in s or "cases" in s:
+        return "Dynamics Cases & Tasks"
+    return "Other"
+
+
 # ---------------------------------
 # DB / Engine
 # ---------------------------------
@@ -359,8 +375,6 @@ def init_db():
                     """
                 )
             )
-
-            # Add missing columns for existing old table structures
             conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_type TEXT"))
             conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS role_type TEXT"))
             conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS raw_duration_seconds INTEGER"))
@@ -378,7 +392,7 @@ def init_db():
 init_db()
 
 # ---------------------------------
-# Normalization + coverage allocation
+# Normalization / Coverage Logic
 # ---------------------------------
 EXPECTED_MAP = {
     "Task ID": "task_id",
@@ -394,35 +408,12 @@ EXPECTED_MAP = {
 
 def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(
-            columns=[
-                "task_id",
-                "team_member",
-                "task_type",
-                "role_type",
-                "raw_duration_seconds",
-                "volume",
-                "day",
-                "week_ending",
-            ]
-        )
+        return pd.DataFrame(columns=list(EXPECTED_MAP.values()))
 
     df = clean_cols(df)
-
     missing = [src for src in EXPECTED_MAP if src not in df.columns]
     if missing:
-        return pd.DataFrame(
-            columns=[
-                "task_id",
-                "team_member",
-                "task_type",
-                "role_type",
-                "raw_duration_seconds",
-                "volume",
-                "day",
-                "week_ending",
-            ]
-        )
+        return pd.DataFrame(columns=list(EXPECTED_MAP.values()))
 
     out = pd.DataFrame()
     for src, dst in EXPECTED_MAP.items():
@@ -443,7 +434,6 @@ def normalize_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
     out["role_type"] = out["role_type"].astype(str).str.strip().str.title()
     out["day"] = out["day"].astype(str).str.strip().str.title()
     out["week_ending"] = out["week_ending"].dt.strftime("%Y-%m-%d")
-
     return out
 
 
@@ -452,7 +442,6 @@ def apply_coverage_logic(tasks_df: pd.DataFrame) -> pd.DataFrame:
         return tasks_df
 
     df = tasks_df.copy()
-
     df["week_ending_dt"] = pd.to_datetime(df["week_ending"], errors="coerce")
     df["work_date_dt"] = derive_work_date(df["week_ending_dt"], df["day"])
     df["work_date"] = df["work_date_dt"].dt.strftime("%Y-%m-%d")
@@ -495,7 +484,6 @@ def apply_coverage_logic(tasks_df: pd.DataFrame) -> pd.DataFrame:
         on=["team_member", "work_date"],
         how="left",
     )
-
     df["coverage_seconds_per_unit"] = df["coverage_seconds_per_unit"].fillna(0.0)
 
     df["effective_duration_seconds"] = df["raw_duration_seconds"]
@@ -504,9 +492,7 @@ def apply_coverage_logic(tasks_df: pd.DataFrame) -> pd.DataFrame:
     ).round().astype(int)
 
     df["effective_duration_seconds"] = pd.to_numeric(df["effective_duration_seconds"], errors="coerce").fillna(0).astype(int)
-
-    df = df.drop(columns=["week_ending_dt", "work_date_dt", "coverage_seconds_per_unit"], errors="ignore")
-    return df
+    return df.drop(columns=["week_ending_dt", "work_date_dt", "coverage_seconds_per_unit"], errors="ignore")
 
 
 def load_month_file(uploaded_file) -> pd.DataFrame:
@@ -517,25 +503,13 @@ def load_month_file(uploaded_file) -> pd.DataFrame:
     for sheet in xls.sheet_names:
         if sheet.strip().lower() == "unmatched task ids":
             continue
-
         raw = pd.read_excel(xls, sheet_name=sheet)
         norm = normalize_tasks_df(raw)
         if not norm.empty:
             frames.append(norm)
 
     if not frames:
-        return pd.DataFrame(
-            columns=[
-                "task_id",
-                "team_member",
-                "task_type",
-                "role_type",
-                "raw_duration_seconds",
-                "volume",
-                "day",
-                "week_ending",
-            ]
-        )
+        return pd.DataFrame(columns=list(EXPECTED_MAP.values()))
 
     return pd.concat(frames, ignore_index=True)
 
@@ -546,7 +520,6 @@ def load_month_file(uploaded_file) -> pd.DataFrame:
 def replace_all_task_data(df: pd.DataFrame):
     with ENGINE.begin() as conn:
         conn.execute(text("DELETE FROM tasks"))
-
         if df.empty:
             return
 
@@ -555,30 +528,105 @@ def replace_all_task_data(df: pd.DataFrame):
                 text(
                     """
                     INSERT INTO tasks (
-                        task_id,
-                        team_member,
-                        task_type,
-                        role_type,
-                        raw_duration_seconds,
-                        effective_duration_seconds,
-                        volume,
-                        day,
-                        week_ending,
-                        work_date,
-                        uploaded_at
+                        task_id, team_member, task_type, role_type,
+                        raw_duration_seconds, effective_duration_seconds,
+                        volume, day, week_ending, work_date, uploaded_at
                     )
                     VALUES (
-                        :task_id,
-                        :team_member,
-                        :task_type,
-                        :role_type,
-                        :raw_duration_seconds,
-                        :effective_duration_seconds,
-                        :volume,
-                        :day,
-                        :week_ending,
-                        :work_date,
-                        :uploaded_at
+                        :task_id, :team_member, :task_type, :role_type,
+                        :raw_duration_seconds, :effective_duration_seconds,
+                        :volume, :day, :week_ending, :work_date, :uploaded_at
+                    )
+                    """
+                ),
+                {
+                    "task_id": r["task_id"],
+                    "team_member": r["team_member"],
+                    "task_type": r["task_type"],
+                    "role_type": r["role_type"],
+                    "raw_duration_seconds": int(r["raw_duration_seconds"]),
+                    "effective_duration_seconds": int(r["effective_duration_seconds"]),
+                    "volume": int(r["volume"]),
+                    "day": r["day"],
+                    "week_ending": r["week_ending"],
+                    "work_date": r["work_date"],
+                    "uploaded_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+                },
+            )
+
+
+def replace_selected_months(df: pd.DataFrame):
+    months = pd.to_datetime(df["week_ending"], errors="coerce").dt.to_period("M").astype(str).dropna().unique().tolist()
+
+    with ENGINE.begin() as conn:
+        for month in months:
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM tasks
+                    WHERE TO_CHAR(TO_DATE(week_ending, 'YYYY-MM-DD'), 'YYYY-MM') = :month
+                    """
+                    if not IS_SQLITE
+                    else """
+                    DELETE FROM tasks
+                    WHERE substr(week_ending, 1, 7) = :month
+                    """
+                ),
+                {"month": month},
+            )
+
+        for _, r in df.iterrows():
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO tasks (
+                        task_id, team_member, task_type, role_type,
+                        raw_duration_seconds, effective_duration_seconds,
+                        volume, day, week_ending, work_date, uploaded_at
+                    )
+                    VALUES (
+                        :task_id, :team_member, :task_type, :role_type,
+                        :raw_duration_seconds, :effective_duration_seconds,
+                        :volume, :day, :week_ending, :work_date, :uploaded_at
+                    )
+                    """
+                ),
+                {
+                    "task_id": r["task_id"],
+                    "team_member": r["team_member"],
+                    "task_type": r["task_type"],
+                    "role_type": r["role_type"],
+                    "raw_duration_seconds": int(r["raw_duration_seconds"]),
+                    "effective_duration_seconds": int(r["effective_duration_seconds"]),
+                    "volume": int(r["volume"]),
+                    "day": r["day"],
+                    "week_ending": r["week_ending"],
+                    "work_date": r["work_date"],
+                    "uploaded_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+                },
+            )
+
+
+def replace_selected_weeks(df: pd.DataFrame):
+    weeks = df["week_ending"].dropna().astype(str).unique().tolist()
+
+    with ENGINE.begin() as conn:
+        for wk in weeks:
+            conn.execute(text("DELETE FROM tasks WHERE week_ending = :w"), {"w": wk})
+
+        for _, r in df.iterrows():
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO tasks (
+                        task_id, team_member, task_type, role_type,
+                        raw_duration_seconds, effective_duration_seconds,
+                        volume, day, week_ending, work_date, uploaded_at
+                    )
+                    VALUES (
+                        :task_id, :team_member, :task_type, :role_type,
+                        :raw_duration_seconds, :effective_duration_seconds,
+                        :volume, :day, :week_ending, :work_date, :uploaded_at
                     )
                     """
                 ),
@@ -604,16 +652,9 @@ def fetch_all_tasks() -> pd.DataFrame:
             text(
                 """
                 SELECT
-                    task_id,
-                    team_member,
-                    task_type,
-                    role_type,
-                    raw_duration_seconds,
-                    effective_duration_seconds,
-                    volume,
-                    day,
-                    week_ending,
-                    work_date
+                    task_id, team_member, task_type, role_type,
+                    raw_duration_seconds, effective_duration_seconds,
+                    volume, day, week_ending, work_date
                 FROM tasks
                 """
             )
@@ -622,16 +663,9 @@ def fetch_all_tasks() -> pd.DataFrame:
     return pd.DataFrame(
         rows,
         columns=[
-            "task_id",
-            "team_member",
-            "task_type",
-            "role_type",
-            "raw_duration_seconds",
-            "effective_duration_seconds",
-            "volume",
-            "day",
-            "week_ending",
-            "work_date",
+            "task_id", "team_member", "task_type", "role_type",
+            "raw_duration_seconds", "effective_duration_seconds",
+            "volume", "day", "week_ending", "work_date"
         ],
     )
 
@@ -674,7 +708,7 @@ def db_row_count() -> int:
 
 
 # ---------------------------------
-# Rollup helpers
+# Rollups
 # ---------------------------------
 def prep_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -685,10 +719,11 @@ def prep_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
     out["work_date_dt"] = pd.to_datetime(out["work_date"], errors="coerce")
     out["task_type_norm"] = out["task_type"].astype(str).str.strip().str.lower()
     out["role_type_norm"] = out["role_type"].astype(str).str.strip().str.lower()
-
     out["month"] = out["week_date"].dt.to_period("M").astype(str)
     out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)
     out["month_label"] = out["week_date"].dt.strftime("%b %Y")
+    out["month_sort"] = out["week_date"].dt.to_period("M").astype(str)
+    out["task_bucket"] = out["task_id"].apply(task_bucket)
     return out
 
 
@@ -730,43 +765,70 @@ def build_task_kpi_table(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     grouped["Total Duration (hh:mm)"] = grouped["total_seconds"].apply(seconds_to_hhmm)
-    grouped["Hours"] = grouped["total_seconds"].apply(seconds_to_hours)
-
-    grouped["Avg Time / Item (hh:mm)"] = grouped.apply(
-        lambda r: seconds_to_hhmm(r["total_seconds"] / r["total_volume"]) if r["total_volume"] > 0 else "00:00",
-        axis=1,
-    )
-
     grouped["Volume"] = grouped["total_volume"].astype(int)
 
-    return grouped[["task_id", "Total Duration (hh:mm)", "Hours", "Volume", "Avg Time / Item (hh:mm)"]]
+    return grouped.rename(columns={"task_id": "Task ID"})[["Task ID", "Total Duration (hh:mm)", "Volume"]]
 
 
-def add_deltas(curr_df: pd.DataFrame, prev_df: pd.DataFrame, key_col: str = "task_id") -> pd.DataFrame:
+def build_task_kpi_table_with_hours(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        df.groupby("task_id", as_index=False)
+        .agg(
+            total_seconds=("effective_duration_seconds", "sum"),
+            total_volume=("volume", "sum"),
+        )
+        .sort_values(["total_seconds", "task_id"], ascending=[False, True])
+    )
+
+    grouped["Total Duration (hh:mm)"] = grouped["total_seconds"].apply(seconds_to_hhmm)
+    grouped["Hours"] = grouped["total_seconds"].apply(seconds_to_hours)
+    grouped["Volume"] = grouped["total_volume"].astype(int)
+
+    return grouped.rename(columns={"task_id": "Task ID"})[["Task ID", "Total Duration (hh:mm)", "Hours", "Volume"]]
+
+
+def add_deltas(curr_df: pd.DataFrame, prev_df: pd.DataFrame, key_col: str = "Task ID") -> pd.DataFrame:
     if curr_df is None or curr_df.empty:
         return pd.DataFrame()
 
     curr = curr_df.copy()
-
     if prev_df is None or prev_df.empty:
-        curr["Δ Hours"] = 0.0
+        if "Hours" in curr.columns:
+            curr["Δ Hours"] = 0.0
         curr["Δ Volume"] = 0
         return curr
 
     prev = prev_df.copy()
+    keep_cols = [key_col]
+    if "Hours" in prev.columns:
+        keep_cols.append("Hours")
+    if "Volume" in prev.columns:
+        keep_cols.append("Volume")
 
-    prev = prev[[key_col, "Hours", "Volume"]].rename(columns={"Hours": "Hours_prev", "Volume": "Volume_prev"})
+    prev = prev[keep_cols].copy()
+    if "Hours" in prev.columns:
+        prev = prev.rename(columns={"Hours": "Hours_prev"})
+    if "Volume" in prev.columns:
+        prev = prev.rename(columns={"Volume": "Volume_prev"})
+
     merged = curr.merge(prev, on=key_col, how="left")
-    merged["Δ Hours"] = merged["Hours"] - merged["Hours_prev"].fillna(0)
-    merged["Δ Volume"] = merged["Volume"] - merged["Volume_prev"].fillna(0)
-    merged = merged.drop(columns=["Hours_prev", "Volume_prev"])
-    return merged
+
+    if "Hours" in merged.columns:
+        merged["Δ Hours"] = merged["Hours"] - merged.get("Hours_prev", 0).fillna(0)
+    if "Volume" in merged.columns:
+        merged["Δ Volume"] = merged["Volume"] - merged.get("Volume_prev", 0).fillna(0)
+
+    drop_cols = [c for c in ["Hours_prev", "Volume_prev"] if c in merged.columns]
+    return merged.drop(columns=drop_cols)
 
 
 # ---------------------------------
 # Tabs
 # ---------------------------------
-tabs = st.tabs(["Weekly", "Monthly", "Quarterly", "Admin Upload"])
+tabs = st.tabs(["Weekly", "Monthly Overview", "Monthly", "Quarterly", "Admin Upload"])
 
 # =================================
 # Weekly
@@ -779,7 +841,7 @@ with tabs[0]:
 
     members = list_team_members()
     if not members:
-        st.info("No data loaded yet. Upload January, February, and March in Admin Upload.")
+        st.info("No data loaded yet. Upload data in Admin Upload.")
     else:
         sel_member = st.selectbox("Team Member", members, index=0)
         weeks = list_weeks_for_member(sel_member)
@@ -796,7 +858,6 @@ with tabs[0]:
                 st.info("No entries found for this week.")
             else:
                 df = prep_for_rollups(df)
-
                 totals = compute_top_metrics(df)
 
                 m1, m2, m3, m4 = st.columns(4)
@@ -851,9 +912,138 @@ with tabs[0]:
                     st.dataframe(weekly_totals, use_container_width=True, hide_index=True)
 
 # =================================
-# Monthly
+# Monthly Overview
 # =================================
 with tabs[1]:
+    section_header(
+        "Monthly Overview",
+        "High-level month-over-month trends, top task drivers, and production oversight."
+    )
+
+    members = list_team_members()
+    if not members:
+        st.info("No data loaded yet. Upload data in Admin Upload.")
+    else:
+        sel_member = st.selectbox("Team Member", members, index=0, key="overview_member")
+        all_df = prep_for_rollups(fetch_all_tasks())
+        member_df = all_df[all_df["team_member"] == sel_member].copy()
+
+        if member_df.empty:
+            st.info("No data for this team member.")
+        else:
+            months = sorted(member_df["month"].dropna().unique().tolist())
+            sel_month = st.selectbox("Month", months, index=len(months) - 1, key="overview_month")
+            cur_df = member_df[member_df["month"] == sel_month].copy()
+
+            month_summary = (
+                member_df.groupby(["month_sort", "month_label"], as_index=False)
+                .agg(
+                    production_seconds=("effective_duration_seconds", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "production"]["effective_duration_seconds"].sum())),
+                    production_volume=("volume", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "production"]["volume"].sum())),
+                    coverage_volume=("volume", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "coverage"]["volume"].sum())),
+                )
+                .sort_values("month_sort")
+            )
+
+            top = compute_top_metrics(cur_df)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Production Hours", fmt_hours(seconds_to_hours(top["prod_primary_seconds"] + top["prod_backup_seconds"])))
+            c2.metric("Coverage Hours", fmt_hours(seconds_to_hours(top["coverage_seconds"])))
+            c3.metric("Production Volume", fmt_int(top["production_volume"]))
+            c4.metric("Coverage Volume", fmt_int(top["coverage_volume"]))
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            if not month_summary.empty:
+                fig = px.bar(
+                    month_summary,
+                    x="month_label",
+                    y="production_volume",
+                    text_auto=True,
+                    title="Production Volume by Month",
+                    color_discrete_sequence=[PRIMARY],
+                )
+                fig = apply_layout(fig, height=320, show_legend=False)
+                fig.update_xaxes(title="")
+                fig.update_yaxes(title="Volume")
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            prod_df = cur_df[cur_df["task_type_norm"] == "production"].copy()
+
+            left, right = st.columns(2)
+
+            with left:
+                section_header("Top Tasks by Volume", "Highest production task volume for the selected month.")
+                if prod_df.empty:
+                    st.info("No production data for this month.")
+                else:
+                    top_volume = (
+                        prod_df.groupby("task_id", as_index=False)["volume"]
+                        .sum()
+                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
+                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
+                        .head(10)
+                    )
+                    st.dataframe(top_volume, use_container_width=True, hide_index=True)
+
+            with right:
+                section_header("Longest Timed Production Tasks", "Production tasks with the highest total duration for the selected month.")
+                if prod_df.empty:
+                    st.info("No production data for this month.")
+                else:
+                    longest = (
+                        prod_df.groupby("task_id", as_index=False)["effective_duration_seconds"]
+                        .sum()
+                        .rename(columns={"task_id": "Task ID", "effective_duration_seconds": "Total Seconds"})
+                        .sort_values(["Total Seconds", "Task ID"], ascending=[False, True])
+                        .head(10)
+                    )
+                    longest["Total Duration (hh:mm)"] = longest["Total Seconds"].apply(seconds_to_hhmm)
+                    longest = longest.drop(columns=["Total Seconds"])
+                    st.dataframe(longest, use_container_width=True, hide_index=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            bucket_left, bucket_right = st.columns(2)
+
+            with bucket_left:
+                section_header("Mailbox Tasks", "Mailbox production tasks for the selected month.")
+                mailbox = prod_df[prod_df["task_bucket"] == "Mailbox"].copy()
+                if mailbox.empty:
+                    st.info("No mailbox tasks for this month.")
+                else:
+                    mailbox_tbl = (
+                        mailbox.groupby("task_id", as_index=False)
+                        .agg(volume=("volume", "sum"), seconds=("effective_duration_seconds", "sum"))
+                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
+                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
+                    )
+                    mailbox_tbl["Total Duration (hh:mm)"] = mailbox_tbl["seconds"].apply(seconds_to_hhmm)
+                    mailbox_tbl = mailbox_tbl.drop(columns=["seconds"])
+                    st.dataframe(mailbox_tbl, use_container_width=True, hide_index=True)
+
+            with bucket_right:
+                section_header("Dynamics Cases & Tasks", "Dynamics-related production tasks for the selected month.")
+                dyn = prod_df[prod_df["task_bucket"] == "Dynamics Cases & Tasks"].copy()
+                if dyn.empty:
+                    st.info("No dynamics cases/tasks for this month.")
+                else:
+                    dyn_tbl = (
+                        dyn.groupby("task_id", as_index=False)
+                        .agg(volume=("volume", "sum"), seconds=("effective_duration_seconds", "sum"))
+                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
+                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
+                    )
+                    dyn_tbl["Total Duration (hh:mm)"] = dyn_tbl["seconds"].apply(seconds_to_hhmm)
+                    dyn_tbl = dyn_tbl.drop(columns=["seconds"])
+                    st.dataframe(dyn_tbl, use_container_width=True, hide_index=True)
+
+# =================================
+# Monthly
+# =================================
+with tabs[2]:
     section_header(
         "Monthly View",
         "Monthly task KPIs using standardized task names and allocated coverage duration."
@@ -861,10 +1051,9 @@ with tabs[1]:
 
     members = list_team_members()
     if not members:
-        st.info("No data loaded yet. Upload month files in Admin Upload.")
+        st.info("No data loaded yet. Upload data in Admin Upload.")
     else:
         sel_member = st.selectbox("Team Member", members, index=0, key="monthly_member")
-
         all_df = prep_for_rollups(fetch_all_tasks())
         member_df = all_df[all_df["team_member"] == sel_member].copy()
 
@@ -873,7 +1062,6 @@ with tabs[1]:
         else:
             months = sorted(member_df["month"].dropna().unique().tolist())
             sel_month = st.selectbox("Month", months, index=len(months) - 1)
-
             cur_df = member_df[member_df["month"] == sel_month].copy()
 
             prev_month = None
@@ -891,49 +1079,53 @@ with tabs[1]:
             c1.metric(
                 "Production (Primary) Hours",
                 fmt_hours(seconds_to_hours(cur_totals["prod_primary_seconds"])),
-                f"{seconds_to_hours(cur_totals['prod_primary_seconds']) - seconds_to_hours(prev_totals['prod_primary_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["prod_primary_seconds"]),
+                                 seconds_to_hours(prev_totals["prod_primary_seconds"]) if prev_totals else None),
             )
             c2.metric(
                 "Production (Backup) Hours",
                 fmt_hours(seconds_to_hours(cur_totals["prod_backup_seconds"])),
-                f"{seconds_to_hours(cur_totals['prod_backup_seconds']) - seconds_to_hours(prev_totals['prod_backup_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["prod_backup_seconds"]),
+                                 seconds_to_hours(prev_totals["prod_backup_seconds"]) if prev_totals else None),
             )
             c3.metric(
                 "Coverage Hours",
                 fmt_hours(seconds_to_hours(cur_totals["coverage_seconds"])),
-                f"{seconds_to_hours(cur_totals['coverage_seconds']) - seconds_to_hours(prev_totals['coverage_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["coverage_seconds"]),
+                                 seconds_to_hours(prev_totals["coverage_seconds"]) if prev_totals else None),
             )
             c4.metric(
                 "Coverage Volume",
                 fmt_int(cur_totals["coverage_volume"]),
-                f"{cur_totals['coverage_volume'] - prev_totals['coverage_volume']:+d}" if prev_totals else ""
+                period_delta_str(cur_totals["coverage_volume"],
+                                 prev_totals["coverage_volume"] if prev_totals else None,
+                                 is_int=True),
             )
 
             st.markdown("<br>", unsafe_allow_html=True)
 
             chart_df = (
-                member_df.groupby("month_label", as_index=False)["effective_duration_seconds"]
+                member_df.groupby(["month_sort", "month_label"], as_index=False)["volume"]
                 .sum()
-                .rename(columns={"effective_duration_seconds": "seconds"})
+                .sort_values("month_sort")
             )
             if not chart_df.empty:
-                chart_df["Hours"] = chart_df["seconds"].apply(seconds_to_hours)
                 fig = px.bar(
                     chart_df,
                     x="month_label",
-                    y="Hours",
-                    text_auto=".2f",
-                    title="Total Hours by Month",
+                    y="volume",
+                    text_auto=True,
+                    title="Total Volume by Month",
                     color_discrete_sequence=[PRIMARY],
                 )
                 fig = apply_layout(fig, height=320, show_legend=False)
                 fig.update_xaxes(title="")
-                fig.update_yaxes(title="Hours")
+                fig.update_yaxes(title="Volume")
                 st.plotly_chart(fig, use_container_width=True)
 
             section_header("Production Tasks (Monthly) — Primary", "Task-level monthly totals and deltas vs prior month.")
-            cur_primary = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "primary")])
-            prev_primary = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "primary")]) if not prev_df.empty else pd.DataFrame()
+            cur_primary = build_task_kpi_table_with_hours(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "primary")])
+            prev_primary = build_task_kpi_table_with_hours(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "primary")]) if not prev_df.empty else pd.DataFrame()
 
             if cur_primary.empty:
                 st.info("No primary production tasks for this month.")
@@ -942,8 +1134,8 @@ with tabs[1]:
                 st.dataframe(style_delta_df(primary_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
             section_header("Production Tasks (Monthly) — Backup", "Backup production totals and deltas vs prior month.")
-            cur_backup = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "backup")])
-            prev_backup = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "backup")]) if not prev_df.empty else pd.DataFrame()
+            cur_backup = build_task_kpi_table_with_hours(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "backup")])
+            prev_backup = build_task_kpi_table_with_hours(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "backup")]) if not prev_df.empty else pd.DataFrame()
 
             if cur_backup.empty:
                 st.info("No backup production tasks for this month.")
@@ -952,8 +1144,8 @@ with tabs[1]:
                 st.dataframe(style_delta_df(backup_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
             section_header("Coverage Tasks (Monthly)", "Coverage task totals based on allocated remaining-day time.")
-            cur_cov = build_task_kpi_table(cur_df[cur_df["task_type_norm"] == "coverage"])
-            prev_cov = build_task_kpi_table(prev_df[prev_df["task_type_norm"] == "coverage"]) if not prev_df.empty else pd.DataFrame()
+            cur_cov = build_task_kpi_table_with_hours(cur_df[cur_df["task_type_norm"] == "coverage"])
+            prev_cov = build_task_kpi_table_with_hours(prev_df[prev_df["task_type_norm"] == "coverage"]) if not prev_df.empty else pd.DataFrame()
 
             if cur_cov.empty:
                 st.info("No coverage tasks for this month.")
@@ -964,7 +1156,7 @@ with tabs[1]:
 # =================================
 # Quarterly
 # =================================
-with tabs[2]:
+with tabs[3]:
     section_header(
         "Quarterly View",
         "Quarterly rollups built from weekly data using Week Ending."
@@ -972,10 +1164,9 @@ with tabs[2]:
 
     members = list_team_members()
     if not members:
-        st.info("No data loaded yet. Upload month files in Admin Upload.")
+        st.info("No data loaded yet. Upload data in Admin Upload.")
     else:
         sel_member = st.selectbox("Team Member", members, index=0, key="quarterly_member")
-
         all_df = prep_for_rollups(fetch_all_tasks())
         member_df = all_df[all_df["team_member"] == sel_member].copy()
 
@@ -1002,49 +1193,53 @@ with tabs[2]:
             c1.metric(
                 "Production (Primary) Hours",
                 fmt_hours(seconds_to_hours(cur_totals["prod_primary_seconds"])),
-                f"{seconds_to_hours(cur_totals['prod_primary_seconds']) - seconds_to_hours(prev_totals['prod_primary_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["prod_primary_seconds"]),
+                                 seconds_to_hours(prev_totals["prod_primary_seconds"]) if prev_totals else None),
             )
             c2.metric(
                 "Production (Backup) Hours",
                 fmt_hours(seconds_to_hours(cur_totals["prod_backup_seconds"])),
-                f"{seconds_to_hours(cur_totals['prod_backup_seconds']) - seconds_to_hours(prev_totals['prod_backup_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["prod_backup_seconds"]),
+                                 seconds_to_hours(prev_totals["prod_backup_seconds"]) if prev_totals else None),
             )
             c3.metric(
                 "Coverage Hours",
                 fmt_hours(seconds_to_hours(cur_totals["coverage_seconds"])),
-                f"{seconds_to_hours(cur_totals['coverage_seconds']) - seconds_to_hours(prev_totals['coverage_seconds']):+,.2f}" if prev_totals else ""
+                period_delta_str(seconds_to_hours(cur_totals["coverage_seconds"]),
+                                 seconds_to_hours(prev_totals["coverage_seconds"]) if prev_totals else None),
             )
             c4.metric(
                 "Coverage Volume",
                 fmt_int(cur_totals["coverage_volume"]),
-                f"{cur_totals['coverage_volume'] - prev_totals['coverage_volume']:+d}" if prev_totals else ""
+                period_delta_str(cur_totals["coverage_volume"],
+                                 prev_totals["coverage_volume"] if prev_totals else None,
+                                 is_int=True),
             )
 
             st.markdown("<br>", unsafe_allow_html=True)
 
             q_chart = (
-                member_df.groupby("quarter", as_index=False)["effective_duration_seconds"]
+                member_df.groupby("quarter", as_index=False)["volume"]
                 .sum()
-                .rename(columns={"effective_duration_seconds": "seconds"})
+                .sort_values("quarter")
             )
             if not q_chart.empty:
-                q_chart["Hours"] = q_chart["seconds"].apply(seconds_to_hours)
                 fig = px.bar(
                     q_chart,
                     x="quarter",
-                    y="Hours",
-                    text_auto=".2f",
-                    title="Total Hours by Quarter",
+                    y="volume",
+                    text_auto=True,
+                    title="Total Volume by Quarter",
                     color_discrete_sequence=[ACCENT],
                 )
                 fig = apply_layout(fig, height=320, show_legend=False)
                 fig.update_xaxes(title="")
-                fig.update_yaxes(title="Hours")
+                fig.update_yaxes(title="Volume")
                 st.plotly_chart(fig, use_container_width=True)
 
             section_header("Production Tasks (Quarterly) — Primary", "Task-level quarterly totals and deltas vs prior quarter.")
-            cur_primary = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "primary")])
-            prev_primary = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "primary")]) if not prev_df.empty else pd.DataFrame()
+            cur_primary = build_task_kpi_table_with_hours(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "primary")])
+            prev_primary = build_task_kpi_table_with_hours(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "primary")]) if not prev_df.empty else pd.DataFrame()
 
             if cur_primary.empty:
                 st.info("No primary production tasks for this quarter.")
@@ -1053,8 +1248,8 @@ with tabs[2]:
                 st.dataframe(style_delta_df(primary_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
             section_header("Production Tasks (Quarterly) — Backup", "Backup production totals and deltas vs prior quarter.")
-            cur_backup = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "backup")])
-            prev_backup = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "backup")]) if not prev_df.empty else pd.DataFrame()
+            cur_backup = build_task_kpi_table_with_hours(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "backup")])
+            prev_backup = build_task_kpi_table_with_hours(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "backup")]) if not prev_df.empty else pd.DataFrame()
 
             if cur_backup.empty:
                 st.info("No backup production tasks for this quarter.")
@@ -1063,8 +1258,8 @@ with tabs[2]:
                 st.dataframe(style_delta_df(backup_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
             section_header("Coverage Tasks (Quarterly)", "Coverage totals based on allocated remaining-day time.")
-            cur_cov = build_task_kpi_table(cur_df[cur_df["task_type_norm"] == "coverage"])
-            prev_cov = build_task_kpi_table(prev_df[prev_df["task_type_norm"] == "coverage"]) if not prev_df.empty else pd.DataFrame()
+            cur_cov = build_task_kpi_table_with_hours(cur_df[cur_df["task_type_norm"] == "coverage"])
+            prev_cov = build_task_kpi_table_with_hours(prev_df[prev_df["task_type_norm"] == "coverage"]) if not prev_df.empty else pd.DataFrame()
 
             if cur_cov.empty:
                 st.info("No coverage tasks for this quarter.")
@@ -1075,17 +1270,23 @@ with tabs[2]:
 # =================================
 # Admin Upload
 # =================================
-with tabs[3]:
+with tabs[4]:
     section_header(
         "Admin Upload",
-        "Replace current Postgres data with the uploaded month files."
+        "Replace all data, selected month data, or selected week data from uploaded files."
     )
 
     current_rows = db_row_count()
     st.metric("Current Rows in Database", fmt_int(current_rows))
 
+    upload_mode = st.selectbox(
+        "Upload Mode",
+        ["Full Replace", "Replace Selected Month(s)", "Replace Selected Week(s)"],
+        index=0,
+    )
+
     uploaded_files = st.file_uploader(
-        "Upload January / February / March clean files",
+        "Upload clean workflow tracker files",
         type=["xlsx"],
         accept_multiple_files=True,
     )
@@ -1114,10 +1315,30 @@ with tabs[3]:
             st.markdown("### Preview")
             st.dataframe(preview_final.head(20), use_container_width=True, hide_index=True)
 
-            if st.button("Replace Database with Uploaded Files"):
-                replace_all_task_data(preview_final)
-                st.success(
-                    f"Upload complete. Database replaced with {len(preview_final):,} task rows."
+            if upload_mode == "Replace Selected Month(s)":
+                preview_months = (
+                    pd.to_datetime(preview_final["week_ending"], errors="coerce")
+                    .dt.to_period("M")
+                    .astype(str)
+                    .dropna()
+                    .unique()
+                    .tolist()
                 )
+                st.info(f"Months to replace: {', '.join(sorted(preview_months))}")
+
+            if upload_mode == "Replace Selected Week(s)":
+                preview_weeks = sorted(preview_final["week_ending"].dropna().astype(str).unique().tolist())
+                st.info(f"Weeks to replace: {', '.join(preview_weeks)}")
+
+            if st.button("Run Upload"):
+                if upload_mode == "Full Replace":
+                    replace_all_task_data(preview_final)
+                    st.success(f"Full replace complete. Database now contains {len(preview_final):,} task rows.")
+                elif upload_mode == "Replace Selected Month(s)":
+                    replace_selected_months(preview_final)
+                    st.success("Selected month data replaced successfully.")
+                elif upload_mode == "Replace Selected Week(s)":
+                    replace_selected_weeks(preview_final)
+                    st.success("Selected week data replaced successfully.")
         else:
             st.warning("No usable task data was found in the uploaded files.")
