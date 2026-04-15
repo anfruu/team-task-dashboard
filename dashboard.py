@@ -10,8 +10,6 @@
 
 import os
 from io import BytesIO
-from pathlib import Path
-from datetime import timedelta
 
 import pandas as pd
 import streamlit as st
@@ -39,8 +37,6 @@ ACCENT = "#7A6FA6"
 WARM = "#C28B52"
 SOFT_RED = "#B86A6A"
 SLATE = "#60758A"
-
-CATEGORY_COLORS = [PRIMARY, SECONDARY, ACCENT, WARM, SLATE, SOFT_RED]
 
 st.markdown(
     f"""
@@ -238,10 +234,6 @@ def seconds_to_hours(seconds) -> float:
         return 0.0
 
 
-def parse_date_like(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
-
-
 def derive_work_date(week_ending: pd.Series, day_name: pd.Series) -> pd.Series:
     week_dt = pd.to_datetime(week_ending, errors="coerce")
     day_clean = day_name.astype(str).str.strip()
@@ -367,6 +359,17 @@ def init_db():
                     """
                 )
             )
+
+            # Add missing columns for existing old table structures
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_type TEXT"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS role_type TEXT"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS raw_duration_seconds INTEGER"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS effective_duration_seconds INTEGER"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS volume INTEGER"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS day TEXT"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS week_ending TEXT"))
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS work_date TEXT"))
+
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_member_week ON tasks(team_member, week_ending)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_member_workdate ON tasks(team_member, work_date)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tasks_taskid ON tasks(task_id)"))
@@ -928,7 +931,6 @@ with tabs[1]:
                 fig.update_yaxes(title="Hours")
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Primary
             section_header("Production Tasks (Monthly) — Primary", "Task-level monthly totals and deltas vs prior month.")
             cur_primary = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "primary")])
             prev_primary = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "primary")]) if not prev_df.empty else pd.DataFrame()
@@ -939,7 +941,6 @@ with tabs[1]:
                 primary_tbl = add_deltas(cur_primary, prev_primary)
                 st.dataframe(style_delta_df(primary_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
-            # Backup
             section_header("Production Tasks (Monthly) — Backup", "Backup production totals and deltas vs prior month.")
             cur_backup = build_task_kpi_table(cur_df[(cur_df["task_type_norm"] == "production") & (cur_df["role_type_norm"] == "backup")])
             prev_backup = build_task_kpi_table(prev_df[(prev_df["task_type_norm"] == "production") & (prev_df["role_type_norm"] == "backup")]) if not prev_df.empty else pd.DataFrame()
@@ -950,7 +951,6 @@ with tabs[1]:
                 backup_tbl = add_deltas(cur_backup, prev_backup)
                 st.dataframe(style_delta_df(backup_tbl, ["Δ Hours", "Δ Volume"]), use_container_width=True, hide_index=True)
 
-            # Coverage
             section_header("Coverage Tasks (Monthly)", "Coverage task totals based on allocated remaining-day time.")
             cur_cov = build_task_kpi_table(cur_df[cur_df["task_type_norm"] == "coverage"])
             prev_cov = build_task_kpi_table(prev_df[prev_df["task_type_norm"] == "coverage"]) if not prev_df.empty else pd.DataFrame()
