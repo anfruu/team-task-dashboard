@@ -306,15 +306,6 @@ def period_delta_str(curr, prev, is_int=False):
         return ""
 
 
-def task_bucket(task_id: str) -> str:
-    s = _clean_str(task_id).lower()
-    if "mailbox" in s:
-        return "Mailbox"
-    if "dynamics" in s or "cases & tasks" in s or "cases" in s:
-        return "Dynamics Cases & Tasks"
-    return "Other"
-
-
 # ---------------------------------
 # DB / Engine
 # ---------------------------------
@@ -723,7 +714,6 @@ def prep_for_rollups(df: pd.DataFrame) -> pd.DataFrame:
     out["quarter"] = out["week_date"].dt.to_period("Q").astype(str)
     out["month_label"] = out["week_date"].dt.strftime("%b %Y")
     out["month_sort"] = out["week_date"].dt.to_period("M").astype(str)
-    out["task_bucket"] = out["task_id"].apply(task_bucket)
     return out
 
 
@@ -788,6 +778,39 @@ def build_task_kpi_table_with_hours(df: pd.DataFrame) -> pd.DataFrame:
     grouped["Volume"] = grouped["total_volume"].astype(int)
 
     return grouped.rename(columns={"task_id": "Task ID"})[["Task ID", "Total Duration (hh:mm)", "Hours", "Volume"]]
+
+
+def build_daily_task_overview(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    daily = (
+        df.groupby(["task_id", "work_date"], as_index=False)
+        .agg(
+            daily_seconds=("effective_duration_seconds", "sum"),
+            daily_volume=("volume", "sum"),
+        )
+    )
+
+    out = (
+        daily.groupby("task_id", as_index=False)
+        .agg(
+            avg_daily_seconds=("daily_seconds", "mean"),
+            total_monthly_seconds=("daily_seconds", "sum"),
+            total_monthly_volume=("daily_volume", "sum"),
+            days_worked=("work_date", "nunique"),
+        )
+        .sort_values(["avg_daily_seconds", "task_id"], ascending=[False, True])
+    )
+
+    out["Avg Daily Time (hh:mm)"] = out["avg_daily_seconds"].apply(seconds_to_hhmm)
+    out["Total Monthly Time (hh:mm)"] = out["total_monthly_seconds"].apply(seconds_to_hhmm)
+    out["Total Monthly Volume"] = out["total_monthly_volume"].astype(int)
+    out["Days Worked"] = out["days_worked"].astype(int)
+
+    return out.rename(columns={"task_id": "Task ID"})[
+        ["Task ID", "Avg Daily Time (hh:mm)", "Total Monthly Time (hh:mm)", "Total Monthly Volume", "Days Worked"]
+    ]
 
 
 def add_deltas(curr_df: pd.DataFrame, prev_df: pd.DataFrame, key_col: str = "Task ID") -> pd.DataFrame:
@@ -917,128 +940,111 @@ with tabs[0]:
 with tabs[1]:
     section_header(
         "Monthly Overview",
-        "High-level month-over-month trends, top task drivers, and production oversight."
+        "Team-level monthly production and coverage trends using average time per day spent."
     )
 
-    members = list_team_members()
-    if not members:
+    all_df = prep_for_rollups(fetch_all_tasks())
+
+    if all_df.empty:
         st.info("No data loaded yet. Upload data in Admin Upload.")
     else:
-        sel_member = st.selectbox("Team Member", members, index=0, key="overview_member")
-        all_df = prep_for_rollups(fetch_all_tasks())
-        member_df = all_df[all_df["team_member"] == sel_member].copy()
+        months = sorted(all_df["month"].dropna().unique().tolist())
+        sel_month = st.selectbox("Month", months, index=len(months) - 1, key="overview_month")
+        cur_df = all_df[all_df["month"] == sel_month].copy()
 
-        if member_df.empty:
-            st.info("No data for this team member.")
-        else:
-            months = sorted(member_df["month"].dropna().unique().tolist())
-            sel_month = st.selectbox("Month", months, index=len(months) - 1, key="overview_month")
-            cur_df = member_df[member_df["month"] == sel_month].copy()
+        prev_month = None
+        try:
+            prev_month = str(pd.Period(sel_month, freq="M") - 1)
+        except Exception:
+            prev_month = None
 
-            month_summary = (
-                member_df.groupby(["month_sort", "month_label"], as_index=False)
-                .agg(
-                    production_seconds=("effective_duration_seconds", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "production"]["effective_duration_seconds"].sum())),
-                    production_volume=("volume", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "production"]["volume"].sum())),
-                    coverage_volume=("volume", lambda s: int(member_df.loc[s.index][member_df.loc[s.index, "task_type_norm"] == "coverage"]["volume"].sum())),
-                )
-                .sort_values("month_sort")
+        prev_df = all_df[all_df["month"] == prev_month].copy() if prev_month in months else pd.DataFrame()
+
+        cur_totals = compute_top_metrics(cur_df)
+        prev_totals = compute_top_metrics(prev_df) if not prev_df.empty else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Production Hours",
+            fmt_hours(seconds_to_hours(cur_totals["prod_primary_seconds"] + cur_totals["prod_backup_seconds"])),
+            period_delta_str(
+                seconds_to_hours(cur_totals["prod_primary_seconds"] + cur_totals["prod_backup_seconds"]),
+                seconds_to_hours(prev_totals["prod_primary_seconds"] + prev_totals["prod_backup_seconds"]) if prev_totals else None,
+            ),
+        )
+        c2.metric(
+            "Coverage Hours",
+            fmt_hours(seconds_to_hours(cur_totals["coverage_seconds"])),
+            period_delta_str(
+                seconds_to_hours(cur_totals["coverage_seconds"]),
+                seconds_to_hours(prev_totals["coverage_seconds"]) if prev_totals else None,
+            ),
+        )
+        c3.metric(
+            "Production Volume",
+            fmt_int(cur_totals["production_volume"]),
+            period_delta_str(
+                cur_totals["production_volume"],
+                prev_totals["production_volume"] if prev_totals else None,
+                is_int=True,
+            ),
+        )
+        c4.metric(
+            "Coverage Volume",
+            fmt_int(cur_totals["coverage_volume"]),
+            period_delta_str(
+                cur_totals["coverage_volume"],
+                prev_totals["coverage_volume"] if prev_totals else None,
+                is_int=True,
+            ),
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        month_summary = (
+            all_df.groupby(["month_sort", "month_label"], as_index=False)
+            .agg(
+                production_volume=("volume", lambda s: int(all_df.loc[s.index][all_df.loc[s.index, "task_type_norm"] == "production"]["volume"].sum())),
+                coverage_volume=("volume", lambda s: int(all_df.loc[s.index][all_df.loc[s.index, "task_type_norm"] == "coverage"]["volume"].sum())),
             )
+            .sort_values("month_sort")
+        )
 
-            top = compute_top_metrics(cur_df)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Production Hours", fmt_hours(seconds_to_hours(top["prod_primary_seconds"] + top["prod_backup_seconds"])))
-            c2.metric("Coverage Hours", fmt_hours(seconds_to_hours(top["coverage_seconds"])))
-            c3.metric("Production Volume", fmt_int(top["production_volume"]))
-            c4.metric("Coverage Volume", fmt_int(top["coverage_volume"]))
+        if not month_summary.empty:
+            fig = px.bar(
+                month_summary,
+                x="month_label",
+                y="production_volume",
+                text_auto=True,
+                title="Production Volume by Month",
+                color_discrete_sequence=[PRIMARY],
+            )
+            fig = apply_layout(fig, height=320, show_legend=False)
+            fig.update_xaxes(title="")
+            fig.update_yaxes(title="Volume")
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
-            if not month_summary.empty:
-                fig = px.bar(
-                    month_summary,
-                    x="month_label",
-                    y="production_volume",
-                    text_auto=True,
-                    title="Production Volume by Month",
-                    color_discrete_sequence=[PRIMARY],
-                )
-                fig = apply_layout(fig, height=320, show_legend=False)
-                fig.update_xaxes(title="")
-                fig.update_yaxes(title="Volume")
-                st.plotly_chart(fig, use_container_width=True)
+        section_header(
+            "Production Overview",
+            "Average time per day, monthly time, monthly volume, and days worked for production tasks."
+        )
+        prod_overview = build_daily_task_overview(cur_df[cur_df["task_type_norm"] == "production"])
+        if prod_overview.empty:
+            st.info("No production data for this month.")
+        else:
+            st.dataframe(prod_overview, use_container_width=True, hide_index=True)
 
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            prod_df = cur_df[cur_df["task_type_norm"] == "production"].copy()
-
-            left, right = st.columns(2)
-
-            with left:
-                section_header("Top Tasks by Volume", "Highest production task volume for the selected month.")
-                if prod_df.empty:
-                    st.info("No production data for this month.")
-                else:
-                    top_volume = (
-                        prod_df.groupby("task_id", as_index=False)["volume"]
-                        .sum()
-                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
-                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
-                        .head(10)
-                    )
-                    st.dataframe(top_volume, use_container_width=True, hide_index=True)
-
-            with right:
-                section_header("Longest Timed Production Tasks", "Production tasks with the highest total duration for the selected month.")
-                if prod_df.empty:
-                    st.info("No production data for this month.")
-                else:
-                    longest = (
-                        prod_df.groupby("task_id", as_index=False)["effective_duration_seconds"]
-                        .sum()
-                        .rename(columns={"task_id": "Task ID", "effective_duration_seconds": "Total Seconds"})
-                        .sort_values(["Total Seconds", "Task ID"], ascending=[False, True])
-                        .head(10)
-                    )
-                    longest["Total Duration (hh:mm)"] = longest["Total Seconds"].apply(seconds_to_hhmm)
-                    longest = longest.drop(columns=["Total Seconds"])
-                    st.dataframe(longest, use_container_width=True, hide_index=True)
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            bucket_left, bucket_right = st.columns(2)
-
-            with bucket_left:
-                section_header("Mailbox Tasks", "Mailbox production tasks for the selected month.")
-                mailbox = prod_df[prod_df["task_bucket"] == "Mailbox"].copy()
-                if mailbox.empty:
-                    st.info("No mailbox tasks for this month.")
-                else:
-                    mailbox_tbl = (
-                        mailbox.groupby("task_id", as_index=False)
-                        .agg(volume=("volume", "sum"), seconds=("effective_duration_seconds", "sum"))
-                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
-                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
-                    )
-                    mailbox_tbl["Total Duration (hh:mm)"] = mailbox_tbl["seconds"].apply(seconds_to_hhmm)
-                    mailbox_tbl = mailbox_tbl.drop(columns=["seconds"])
-                    st.dataframe(mailbox_tbl, use_container_width=True, hide_index=True)
-
-            with bucket_right:
-                section_header("Dynamics Cases & Tasks", "Dynamics-related production tasks for the selected month.")
-                dyn = prod_df[prod_df["task_bucket"] == "Dynamics Cases & Tasks"].copy()
-                if dyn.empty:
-                    st.info("No dynamics cases/tasks for this month.")
-                else:
-                    dyn_tbl = (
-                        dyn.groupby("task_id", as_index=False)
-                        .agg(volume=("volume", "sum"), seconds=("effective_duration_seconds", "sum"))
-                        .rename(columns={"task_id": "Task ID", "volume": "Volume"})
-                        .sort_values(["Volume", "Task ID"], ascending=[False, True])
-                    )
-                    dyn_tbl["Total Duration (hh:mm)"] = dyn_tbl["seconds"].apply(seconds_to_hhmm)
-                    dyn_tbl = dyn_tbl.drop(columns=["seconds"])
-                    st.dataframe(dyn_tbl, use_container_width=True, hide_index=True)
+        section_header(
+            "Coverage Overview",
+            "Average time per day, monthly time, monthly volume, and days worked for coverage tasks."
+        )
+        cov_overview = build_daily_task_overview(cur_df[cur_df["task_type_norm"] == "coverage"])
+        if cov_overview.empty:
+            st.info("No coverage data for this month.")
+        else:
+            st.dataframe(cov_overview, use_container_width=True, hide_index=True)
 
 # =================================
 # Monthly
